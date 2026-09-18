@@ -1,0 +1,23 @@
+; http://editorconfig.org/
+
+root = true
+
+[*]
+end_of_line = lf
+insert_final_newline = true
+charset = utf-8
+trim_trailing_whitespace = true
+
+[*.go]
+indent_style = tab
+indent_size = 4
+tab_width = 4
+
+; Go tooling writes tabs into the require blocks; an editor that helpfully
+; converts them produces a diff on the next `go mod tidy`.
+[go.{mod,sum}]
+indent_style = tab
+
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2

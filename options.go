@@ -145,7 +145,8 @@ func WithHTTPClient(hc *http.Client) Option {
 	return func(c *config) { c.http = hc }
 }
 
-// WithEvents installs a callback for metrics and logging.
+// WithEvents installs a callback for metrics and logging. [Metrics.Observe]
+// is the ready-made one for Prometheus.
 //
 // It runs on the calling goroutine, so keep it cheap and do not call
 // back into the client from it.

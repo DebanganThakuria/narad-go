@@ -13,7 +13,7 @@ commit. Underneath, a topic is a partitioned append-only log with offsets
 and retention, which is what pays for replay, cheap fan-out, and messages
 that survive being consumed.
 
-It depends on **nothing but the standard library**.
+Its one dependency is the Prometheus client, for the built-in metrics.
 
 ## The whole of it
 
@@ -171,15 +171,11 @@ anything finer, use `WithEvents`.
 
 ## Metrics
 
-Prometheus lives in a separate module so the client itself stays free of
-dependencies:
-
-```sh
-go get github.com/debanganthakuria/narad-go/prometheus
-```
+Prometheus metrics are built in. Register them and hand `Observe` to the
+client:
 
 ```go
-metrics := naradprom.New(prometheus.DefaultRegisterer)
+metrics := narad.NewMetrics(prometheus.DefaultRegisterer)
 client, err := narad.New(addr, narad.WithEvents(metrics.Observe))
 ```
 
@@ -190,12 +186,12 @@ Give it a prefix to scope the metrics to your service, or to tell two
 clients in one process apart on a registry that refuses duplicate names:
 
 ```go
-metrics := naradprom.New(reg, naradprom.WithPrefix("payments"))
+metrics := narad.NewMetrics(reg, narad.WithMetricsPrefix("payments"))
 // payments_narad_requests_total, and so on
 ```
 
-`NewWithError` is the same thing without the panic, for when the prefix
-comes from configuration. Or skip the module and write your own handler
+`NewMetricsWithError` is the same thing without the panic, for when the
+prefix comes from configuration. Or skip it and write your own handler
 for `narad.Event`, which reports anywhere you like.
 
 ## Also here

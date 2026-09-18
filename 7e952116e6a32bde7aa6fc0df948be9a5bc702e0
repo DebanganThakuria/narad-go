@@ -1,0 +1,12 @@
+.github/workflows/ci.yml
+  695cd152-e62f-408d-9485-082f9ee9eb67:2026-09-18T07:14:29.375Z 12-13
+README.md
+  695cd152-e62f-408d-9485-082f9ee9eb67:2026-09-18T07:14:23.396Z 16,174-175,178,189,193-194
+metrics.go
+  695cd152-e62f-408d-9485-082f9ee9eb67:2026-09-18T07:13:21.960Z 1,12-14,16-17,19-20,22,26,36-38,41-49,51-52,60,65,69-72,79-80,85-86,90-91,97,104,117,124,131,137-138,140,148,151,170,172,174,176,178,180,182,185
+metrics_test.go
+  695cd152-e62f-408d-9485-082f9ee9eb67:2026-09-18T07:13:46.957Z 1,12-13,30-33,41,57,61-62,64,77,81,84,87,92,96,101,107,112,115,126-133,147-148,154,186-189
+options.go
+  695cd152-e62f-408d-9485-082f9ee9eb67:2026-09-18T07:14:06.864Z 148-149
+---
+{"schema_version": "authorship/3.0.0", "base_commit_sha": "HEAD~1", "prompts": {"695cd152-e62f-408d-9485-082f9ee9eb67:2026-09-18T07:14:29.375Z": {"agent_id": {"tool": "claude_code", "model": ""}, "human_author": "debangan.thakuria@razorpay.com", "accepted_lines": 2, "overriden_lines": 0}, "695cd152-e62f-408d-9485-082f9ee9eb67:2026-09-18T07:14:23.396Z": {"agent_id": {"tool": "claude_code", "model": ""}, "human_author": "debangan.thakuria@razorpay.com", "accepted_lines": 7, "overriden_lines": 0}, "695cd152-e62f-408d-9485-082f9ee9eb67:2026-09-18T07:13:21.960Z": {"agent_id": {"tool": "claude_code", "model": ""}, "human_author": "debangan.thakuria@razorpay.com", "accepted_lines": 54, "overriden_lines": 0}, "695cd152-e62f-408d-9485-082f9ee9eb67:2026-09-18T07:13:46.957Z": {"agent_id": {"tool": "claude_code", "model": ""}, "human_author": "debangan.thakuria@razorpay.com", "accepted_lines": 37, "overriden_lines": 0}, "695cd152-e62f-408d-9485-082f9ee9eb67:2026-09-18T07:14:06.864Z": {"agent_id": {"tool": "claude_code", "model": ""}, "human_author": "debangan.thakuria@razorpay.com", "accepted_lines": 2, "overriden_lines": 0}}}

@@ -1,0 +1,9 @@
+# Binaries and build output
+/bin/
+*.test
+*.out
+
+# Editors
+.idea/
+.vscode/
+.DS_Store

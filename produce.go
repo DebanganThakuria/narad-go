@@ -31,6 +31,9 @@ type produceConfig struct {
 // key's messages together and makes fan-out cheap. It is not an ordering
 // guarantee: Narad does not offer one, and while a node is down a key's
 // messages walk forward to a live partition.
+//
+// A key can be any bytes, text or not, and a consumer reads back the
+// same bytes in [Message.Key].
 func WithKey(key string) ProduceOption {
 	return func(c *produceConfig) { c.key = key }
 }

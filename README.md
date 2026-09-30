@@ -214,6 +214,13 @@ string you really sent. `msg.Bytes()` unquotes it, which is right for the
 first and loses the quotes on the second. Send a struct and read it with
 `msg.Into` and the question never comes up.
 
+Keys do not have this problem. A key can be any bytes, and `msg.Key`
+holds exactly the bytes it was produced with: the broker sends a key that
+is not valid UTF-8 as base64 with a flag, and the client decodes it.
+`Key` is a string because `WithKey` takes one, so use `[]byte(msg.Key)`
+when the bytes matter. A message produced without a key has an empty
+`Key`.
+
 ## Compatibility
 
 Go 1.23 or later. Narad's `/v1` HTTP surface is stable, so a client built

@@ -671,6 +671,131 @@ func TestPayloadDecoding(t *testing.T) {
 	})
 }
 
+// TestKeyDecoding serves each reply exactly as the broker writes it and
+// reads it back through ReadAt, so the whole decode path is covered, not
+// only the unmarshal.
+func TestKeyDecoding(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		fields  string // the key and payload members of the reply
+		key     string
+		payload string // what Bytes should return
+	}{
+		{
+			name:    "base64 key is decoded",
+			fields:  `"key":"AAECg/8=","key_encoding":"base64","payload":{"id":"o1"}`,
+			key:     "\x00\x01\x02\x83\xff",
+			payload: `{"id":"o1"}`,
+		},
+		{
+			name:    "plain key is kept",
+			fields:  `"key":"customer-42","payload":{"id":"o1"}`,
+			key:     "customer-42",
+			payload: `{"id":"o1"}`,
+		},
+		{
+			// Only the flag says base64. Without it, text that happens
+			// to be valid base64 is still the key.
+			name:    "plain key that looks like base64 is kept",
+			fields:  `"key":"AAECg/8=","payload":{"id":"o1"}`,
+			key:     "AAECg/8=",
+			payload: `{"id":"o1"}`,
+		},
+		{
+			name:    "escaped text key is unescaped",
+			fields:  `"key":"café\t ","payload":{"id":"o1"}`,
+			key:     "café\t ",
+			payload: `{"id":"o1"}`,
+		},
+		{
+			name:    "no key",
+			fields:  `"payload":{"id":"o1"}`,
+			key:     "",
+			payload: `{"id":"o1"}`,
+		},
+		{
+			// A key that is itself JSON is text like any other: it is
+			// not parsed, and the quotes around it are transport.
+			name:    "key that is a JSON object",
+			fields:  `"key":"{\"id\":7}","payload":{"id":"o1"}`,
+			key:     `{"id":7}`,
+			payload: `{"id":"o1"}`,
+		},
+		{
+			name:    "key that is a JSON string",
+			fields:  `"key":"\"quoted\"","payload":{"id":"o1"}`,
+			key:     `"quoted"`,
+			payload: `{"id":"o1"}`,
+		},
+		{
+			name:    "key that is a JSON number",
+			fields:  `"key":"123","payload":{"id":"o1"}`,
+			key:     "123",
+			payload: `{"id":"o1"}`,
+		},
+		{
+			name:    "payload and key both base64",
+			fields:  `"key":"/w==","key_encoding":"base64","payload":"AAE=","payload_encoding":"base64"`,
+			key:     "\xff",
+			payload: "\x00\x01",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"topic":"orders","partition":2,"offset":7,%s,"timestamp":1700000000,"receipt_handle":"2:7:9"}`,
+					tc.fields)
+			})
+
+			msg, err := c.ReadAt(context.Background(), "orders", 2, 7)
+			if err != nil {
+				t.Fatalf("ReadAt: %v", err)
+			}
+			if msg.Key != tc.key {
+				t.Errorf("Key = %q, want %q", msg.Key, tc.key)
+			}
+			raw, err := msg.Bytes()
+			if err != nil {
+				t.Fatalf("Bytes: %v", err)
+			}
+			if string(raw) != tc.payload {
+				t.Errorf("Bytes() = %q, want %q", raw, tc.payload)
+			}
+			// The rest of the message decodes as before, and the handle
+			// back to the client survives the custom decoding.
+			if msg.Topic != "orders" || msg.Partition != 2 || msg.Offset != 7 ||
+				msg.Timestamp != 1700000000 || msg.Receipt != "2:7:9" {
+				t.Errorf("message decoded as %+v", msg)
+			}
+			if msg.client != c {
+				t.Error("the decoded message lost its client, so it cannot be settled")
+			}
+		})
+	}
+}
+
+func TestKeyDecodingRejectsWhatItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	for name, fields := range map[string]string{
+		"corrupt base64":   `"key":"!!!","key_encoding":"base64"`,
+		"unknown encoding": `"key":"ff","key_encoding":"hex"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var m Message
+			err := json.Unmarshal([]byte(`{"topic":"orders",`+fields+`,"payload":{}}`), &m)
+			if err == nil {
+				t.Fatalf("decoded key %q, want an error rather than a guess", m.Key)
+			}
+		})
+	}
+}
+
 // logBroker serves ReadAt against an in-memory log, so replay can be
 // tested against something that behaves like a partitioned topic.
 type logBroker struct {

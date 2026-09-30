@@ -24,7 +24,15 @@ type Message struct {
 	Partition int `json:"partition"`
 	// Offset is its position in that partition's log.
 	Offset int64 `json:"offset"`
-	// Key is the partition key it was produced with, if any.
+	// Key is the partition key it was produced with, byte for byte, or
+	// empty when it was produced without one.
+	//
+	// It is a string because [WithKey] takes one, but read it as bytes:
+	// a key can be any bytes, and one that is not valid UTF-8 (a hash,
+	// a packed id) arrives base64-encoded and is decoded here, so Key
+	// holds what the producer sent rather than its transport form. Use
+	// []byte(msg.Key) when the bytes matter, and check utf8.ValidString
+	// before treating it as text.
 	Key string `json:"key,omitempty"`
 	// Receipt is the token that proves the lease. It is opaque, and
 	// empty for a message from [Client.ReadAt], which reserves nothing.
@@ -43,6 +51,40 @@ type Message struct {
 	// every error and log line without re-parsing the payload.
 	env        *Envelope
 	envChecked bool
+}
+
+// UnmarshalJSON decodes a message as the broker sends it.
+//
+// The broker sends a key that is not valid UTF-8 as base64 with
+// "key_encoding":"base64" beside it, the way it flags a binary payload.
+// This decodes that key, so [Message.Key] is the key that was produced
+// and not its base64 text. The payload is left as the broker encoded it,
+// for [Message.Bytes] to decode.
+func (m *Message) UnmarshalJSON(data []byte) error {
+	// plain has Message's fields and none of its methods, so decoding
+	// into it does not call this method again.
+	type plain Message
+	wire := struct {
+		*plain
+		KeyEncoding string `json:"key_encoding"`
+	}{plain: (*plain)(m)}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	switch wire.KeyEncoding {
+	case "":
+	case "base64":
+		key, err := base64.StdEncoding.DecodeString(m.Key)
+		if err != nil {
+			return fmt.Errorf("key marked base64 is not base64: %w", err)
+		}
+		m.Key = string(key)
+	default:
+		// Guessing would hand back the wrong key, which then routes a
+		// Retry to the wrong partition. Failing says what happened.
+		return fmt.Errorf("unknown key encoding %q", wire.KeyEncoding)
+	}
+	return nil
 }
 
 // ID is the envelope's message id, or empty when the message was

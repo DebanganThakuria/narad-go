@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // fakeBroker is just enough of Narad to drive a consumer: a queue of
@@ -793,6 +794,43 @@ func TestKeyDecodingRejectsWhatItCannotRead(t *testing.T) {
 				t.Fatalf("decoded key %q, want an error rather than a guess", m.Key)
 			}
 		})
+	}
+}
+
+func TestMessageJSONRoundTripKeepsTheKey(t *testing.T) {
+	t.Parallel()
+
+	for _, key := range []string{"\x00\x01\x02\x83\xff", "customer-42", `{"id":7}`, ""} {
+		in := Message{Topic: "orders", Partition: 1, Offset: 3, Key: key,
+			Payload: json.RawMessage(`"AAE="`), Encoding: "base64"}
+		out, err := json.Marshal(in)
+		if err != nil {
+			t.Fatalf("Marshal(key %q): %v", key, err)
+		}
+		// The wire form matches the broker's: flagged only when binary,
+		// and no key member at all for a keyless message.
+		var fields map[string]any
+		if err := json.Unmarshal(out, &fields); err != nil {
+			t.Fatalf("Marshal(key %q) wrote %s: %v", key, out, err)
+		}
+		_, hasKey := fields["key"]
+		if hasKey != (key != "") {
+			t.Errorf("key %q: wrote %s", key, out)
+		}
+		if binary := key != "" && !utf8.ValidString(key); (fields["key_encoding"] == "base64") != binary {
+			t.Errorf("key %q: wrote %s, binary=%v", key, out, binary)
+		}
+
+		var back Message
+		if err := json.Unmarshal(out, &back); err != nil {
+			t.Fatalf("Unmarshal(%s): %v", out, err)
+		}
+		if back.Key != key {
+			t.Errorf("key %q came back as %q", key, back.Key)
+		}
+		if raw, err := back.Bytes(); err != nil || string(raw) != "\x00\x01" {
+			t.Errorf("payload came back as %q, err %v", raw, err)
+		}
 	}
 }
 

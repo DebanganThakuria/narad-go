@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+	"unicode/utf8"
 )
 
 // A Message is one record handed to a consumer.
@@ -85,6 +86,23 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("unknown key encoding %q", wire.KeyEncoding)
 	}
 	return nil
+}
+
+// MarshalJSON encodes a message the way the broker does, so a message
+// written out and read back keeps its key. A key that is not valid UTF-8
+// goes as base64 with "key_encoding":"base64"; plain JSON would replace
+// its invalid bytes and lose the key.
+func (m Message) MarshalJSON() ([]byte, error) {
+	type plain Message
+	wire := struct {
+		plain
+		KeyEncoding string `json:"key_encoding,omitempty"`
+	}{plain: plain(m)}
+	if !utf8.ValidString(m.Key) {
+		wire.Key = base64.StdEncoding.EncodeToString([]byte(m.Key))
+		wire.KeyEncoding = "base64"
+	}
+	return json.Marshal(wire)
 }
 
 // ID is the envelope's message id, or empty when the message was

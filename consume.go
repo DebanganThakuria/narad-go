@@ -531,7 +531,9 @@ func keepLease(ctx context.Context, cancelHandler context.CancelFunc, msg *Messa
 				if err == nil {
 					continue
 				}
-				if errorIs(err, ErrLeaseLost) && !msg.isSettled() {
+				// A 410 while the handler's own Ack or Nack is in flight
+				// is most likely that settle spending the handle.
+				if errorIs(err, ErrLeaseLost) && !msg.isSettled() && !msg.isSettling() {
 					close(k.gone)
 					cancelHandler()
 					return

@@ -398,8 +398,9 @@ func (l *batchLeases) renew(ctx context.Context) {
 	defer cancel()
 	for j, err := range l.client.settleMany(extendCtx, opExtend, msgs) {
 		// Any other failure is not proof the lease is gone, and the
-		// next round is still inside the window.
-		if !errorIs(err, ErrLeaseLost) || msgs[j].isSettled() {
+		// next round is still inside the window. Nor is a 410 that met
+		// the handler's own Ack or Nack, settled or still in flight.
+		if !errorIs(err, ErrLeaseLost) || msgs[j].isSettled() || msgs[j].isSettling() {
 			continue
 		}
 		it := &l.items[index[j]]

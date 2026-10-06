@@ -1029,3 +1029,152 @@ func TestBatchReportsErrorsOneAtATime(t *testing.T) {
 	}
 }
 
+// ackRaceBroker answers the handler's ack of one message only after a
+// lease renewal of that message has been answered 410, as the broker
+// does once the ack has landed and spent the handle: the renewal races
+// an ack that worked.
+type ackRaceBroker struct {
+	racing     string
+	messages   []*Message
+	served     atomic.Bool
+	ackLanded  chan struct{}
+	extendGone chan struct{}
+	landedOnce sync.Once
+	goneOnce   sync.Once
+	otherAcked atomic.Int32
+}
+
+func (b *ackRaceBroker) handler(t *testing.T) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/consume"):
+			if b.served.Swap(true) {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if query.Get("max") == "" {
+				_ = json.NewEncoder(w).Encode(b.messages[0])
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"messages": b.messages})
+
+		case strings.HasSuffix(r.URL.Path, "/ack"):
+			var handles []string
+			if handle := query.Get("receipt_handle"); handle != "" {
+				handles = []string{handle}
+			} else {
+				var body struct {
+					Handles []string `json:"receipt_handles"`
+				}
+				raw, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(raw, &body)
+				handles = body.Handles
+			}
+			statuses := make([]int, len(handles))
+			for i, handle := range handles {
+				statuses[i] = http.StatusNoContent
+				switch {
+				case handle != b.racing:
+					if query.Get("extend") == "" {
+						b.otherAcked.Add(1)
+					}
+				case query.Get("extend") == "true":
+					select {
+					case <-b.ackLanded:
+						statuses[i] = http.StatusGone
+						defer b.goneOnce.Do(func() { close(b.extendGone) })
+					default:
+					}
+				default:
+					b.landedOnce.Do(func() { close(b.ackLanded) })
+					select {
+					case <-b.extendGone:
+						// Long enough for the client to act on the 410
+						// before it reads this ack's 204.
+						time.Sleep(200 * time.Millisecond)
+					case <-time.After(5 * time.Second):
+						t.Error("no renewal raced the ack")
+					}
+				}
+			}
+			if query.Get("receipt_handle") != "" {
+				if statuses[0] != http.StatusNoContent {
+					writeBrokerError(w, statuses[0], "receipt handle is no longer valid")
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			results := make([]map[string]any, len(statuses))
+			for i, status := range statuses {
+				results[i] = map[string]any{"status": status}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"results": results})
+
+		default: // topic lookup: renew every second
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"name":"orders","partitions":3,"visibility_timeout_ms":3000}`)
+		}
+	}
+}
+
+// A renewal answered 410 because the handler's own ack has just landed
+// does not mean the lease was lost: the ack is left to finish, and
+// nothing is reported, with or without a batch.
+func TestARenewalRacingTheHandlersAckDoesNotCancelIt(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		msgs []*Message
+		opts []ConsumeOption
+	}{
+		{"single", []*Message{msgAt(1, "1:1:9")}, nil},
+		{"batch", []*Message{msgAt(1, "1:1:9"), msgAt(2, "1:2:9")}, []ConsumeOption{WithBatch(2)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			b := &ackRaceBroker{
+				racing: "1:1:9", messages: tc.msgs,
+				ackLanded: make(chan struct{}), extendGone: make(chan struct{}),
+			}
+			server := httptest.NewServer(b.handler(t))
+			t.Cleanup(server.Close)
+			c, err := New(server.URL, WithRetries(3),
+				WithBackoff(time.Millisecond, time.Millisecond), WithoutBreaker())
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() { _ = c.Close() })
+
+			var log errorLog
+			ackErr := make(chan error, 1)
+			consumeInBackground(t, c, func(ctx context.Context, msg *Message) error {
+				if msg.Receipt != b.racing {
+					return nil
+				}
+				err := msg.Ack(ctx)
+				ackErr <- err
+				return err
+			}, append(tc.opts, WithErrorHandler(log.handler))...)
+
+			select {
+			case err := <-ackErr:
+				if err != nil {
+					t.Errorf("Ack = %v, want nil: it landed", err)
+				}
+			case <-time.After(8 * time.Second):
+				t.Fatal("the handler's ack never returned")
+			}
+			waitFor(t, func() bool { return b.otherAcked.Load() >= int32(len(tc.msgs)-1) }, "the rest of the batch to be acked")
+			time.Sleep(50 * time.Millisecond)
+			if errs := log.of(b.racing); len(errs) != 0 {
+				t.Errorf("reported %v for a message whose ack landed", errs)
+			}
+		})
+	}
+}

@@ -56,6 +56,10 @@ type Message struct {
 	// Read and written with sync/atomic; a plain field rather than an
 	// atomic.Bool, which would make copying a Message a vet error.
 	settled uint32
+	// settling counts the Acks and Nacks of the message in flight, also
+	// with sync/atomic. A renewal answered 410 while one is in flight
+	// most likely met the handle that settle just spent.
+	settling int32
 	// env caches the decoded envelope, so the id is cheap to put in
 	// every error and log line without re-parsing the payload.
 	env        *Envelope
@@ -152,6 +156,9 @@ func (m *Message) Leased() bool { return m.Receipt != "" }
 func (m *Message) isSettled() bool { return atomic.LoadUint32(&m.settled) == 1 }
 
 func (m *Message) markSettled() { atomic.StoreUint32(&m.settled, 1) }
+
+// isSettling reports whether an Ack or Nack of the message is in flight.
+func (m *Message) isSettling() bool { return atomic.LoadInt32(&m.settling) > 0 }
 
 // Into decodes the message into v.
 //
@@ -271,6 +278,12 @@ func (m *Message) settleFrom(ctx context.Context, op string, extra map[string]st
 	}
 	if !m.Leased() {
 		return fmt.Errorf("narad: %s %s: %w", op, m.describe(), ErrNoLease)
+	}
+	if op == opAck || op == opNack {
+		// Until this returns, a renewal's 410 is not proof the lease
+		// was lost, and acting on it would cancel this very settle.
+		atomic.AddInt32(&m.settling, 1)
+		defer atomic.AddInt32(&m.settling, -1)
 	}
 
 	query := url.Values{"receipt_handle": {m.Receipt}}

@@ -26,7 +26,9 @@ type Message struct {
 	// Offset is its position in that partition's log.
 	Offset int64 `json:"offset"`
 	// Key is the partition key it was produced with, byte for byte, or
-	// empty when it was produced without one.
+	// empty when it was produced without one. (A broker before 3.1.0
+	// invented a key-<n> for a keyless message; from 3.1.0 on the broker
+	// sends no key, and messages it stored before keep theirs.)
 	//
 	// It is a string because [WithKey] takes one, but read it as bytes:
 	// a key can be any bytes, and one that is not valid UTF-8 (a hash,

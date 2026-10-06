@@ -75,6 +75,24 @@ func TestProduceSendsKeyAndPartition(t *testing.T) {
 	}
 }
 
+// A keyless message is spread round-robin by the broker, so the client
+// must not send a key parameter at all, not even an empty one.
+func TestProduceWithoutAKeySendsNoKey(t *testing.T) {
+	t.Parallel()
+
+	var query map[string][]string
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		query = r.URL.Query()
+		w.WriteHeader(http.StatusAccepted)
+	})
+	if err := c.Produce(context.Background(), "orders", order{ID: "o1"}); err != nil {
+		t.Fatalf("Produce: %v", err)
+	}
+	if len(query) != 0 {
+		t.Errorf("query = %v, want none", query)
+	}
+}
+
 func TestProduceRejectsBadInput(t *testing.T) {
 	t.Parallel()
 

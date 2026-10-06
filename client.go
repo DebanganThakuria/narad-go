@@ -30,6 +30,9 @@ const (
 	opAck          = "ack"
 	opNack         = "nack"
 	opExtend       = "extend"
+	opCreateTopic  = "create topic"
+	opDeleteTopic  = "delete topic"
+	opSetSchema    = "set schema"
 )
 
 const (
@@ -274,9 +277,13 @@ func (c *Client) delay(err error, attempt int) time.Duration {
 
 // movesOn reports whether a failure is about the node that answered
 // rather than the cluster, so trying another node is the fix.
+//
+// An uncertain 503 is not: the change it was about may still be applied
+// wherever it went, and the wait the server asked for gives it the time
+// to settle before the retry.
 func movesOn(err error) bool {
 	var apiErr *Error
-	return errors.As(err, &apiErr) && apiErr.Status == http.StatusServiceUnavailable
+	return errors.As(err, &apiErr) && apiErr.Status == http.StatusServiceUnavailable && !Uncertain(err)
 }
 
 // attempt performs one HTTP request.

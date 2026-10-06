@@ -195,6 +195,13 @@ func Retryable(err error) bool {
 // that gave up after passing the request on. Getting that backwards
 // would make an ack that never happened look as though it did, which is
 // the one outcome the lease exists to prevent.
+//
+// A 503 on a topic write ([Client.CreateTopic], [Client.DeleteTopic],
+// [Client.SetSchema]) is uncertain too, as is any 503 whose message says
+// the change may still be applied: the leader may have taken the change
+// before the answer was lost. A resend can then meet its own change, so
+// a create that worked reports [ErrExists]. Read the topic back before
+// deciding.
 func Uncertain(err error) bool {
 	var connErr *ConnError
 	if errors.As(err, &connErr) {
@@ -211,18 +218,33 @@ func Uncertain(err error) bool {
 			// have acted on it.
 			return true
 		case http.StatusServiceUnavailable:
-			if apiErr.Op != opProduce && apiErr.Op != opProduceBatch {
-				return false
+			if strings.Contains(apiErr.Message, outcomeUnknown) {
+				// The leader appended the change and then lost its
+				// leadership; a later leader may still commit it.
+				return true
 			}
-			// The broker's own produce 503s store nothing, but the
-			// status alone cannot tell them from a proxy's, which may
-			// have passed the request on, so only the broker's
-			// messages make a produce 503 certain.
-			return !storedNothing(apiErr.Message)
+			switch apiErr.Op {
+			case opProduce, opProduceBatch:
+				// The broker's own produce 503s store nothing, but the
+				// status alone cannot tell them from a proxy's, which
+				// may have passed the request on, so only the broker's
+				// messages make a produce 503 certain.
+				return !storedNothing(apiErr.Message)
+			case opCreateTopic, opDeleteTopic, opSetSchema:
+				// A follower forwards a topic write to the leader, and a
+				// forward that got no answer is a 503 whose text varies
+				// with the cause while the leader may have applied it.
+				return true
+			}
+			return false
 		}
 	}
 	return false
 }
+
+// outcomeUnknown is the text a 3.1.0 broker puts in a 503 for a write
+// whose outcome it does not know.
+const outcomeUnknown = "the change may still be applied"
 
 // storedNothing reports whether a produce 503's message is one the
 // broker sends before anything is written: a node being decommissioned,

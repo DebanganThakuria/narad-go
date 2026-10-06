@@ -323,7 +323,7 @@ func (c *Client) CreateTopic(ctx context.Context, name string, opts ...TopicOpti
 		path:        "/v1/topics",
 		body:        body,
 		contentType: "application/json",
-		op:          "create topic",
+		op:          opCreateTopic,
 		topic:       name,
 		ok:          []int{http.StatusCreated},
 	})
@@ -331,7 +331,7 @@ func (c *Client) CreateTopic(ctx context.Context, name string, opts ...TopicOpti
 		return out, err
 	}
 	var record topicJSON
-	if err := decode(res.body, &record, "create topic"); err != nil {
+	if err := decode(res.body, &record, opCreateTopic); err != nil {
 		return out, err
 	}
 	return record.toTopic(), nil
@@ -440,7 +440,7 @@ func (c *Client) DeleteTopic(ctx context.Context, name string) error {
 	_, err := c.do(ctx, call{
 		method: http.MethodDelete,
 		path:   "/v1/topics/" + url.PathEscape(name),
-		op:     "delete topic",
+		op:     opDeleteTopic,
 		topic:  name,
 		ok:     []int{http.StatusNoContent, http.StatusNotFound},
 	})
@@ -488,7 +488,7 @@ func (c *Client) SetSchema(ctx context.Context, name string, opts ...TopicOption
 		path:        "/v1/topics/" + url.PathEscape(name),
 		body:        body,
 		contentType: "application/json",
-		op:          "set schema",
+		op:          opSetSchema,
 		topic:       name,
 		ok:          []int{http.StatusOK},
 	})
@@ -496,7 +496,7 @@ func (c *Client) SetSchema(ctx context.Context, name string, opts ...TopicOption
 		return out, err
 	}
 	var record topicJSON
-	if err := decode(res.body, &record, "set schema"); err != nil {
+	if err := decode(res.body, &record, opSetSchema); err != nil {
 		return out, err
 	}
 	return record.toTopic(), nil

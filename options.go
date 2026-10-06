@@ -88,7 +88,8 @@ func WithBackoff(first, max time.Duration) Option {
 // default retries, because consumers have to tolerate duplicates under
 // at-least-once anyway and a lost message is not recoverable. Choose
 // this when a duplicate is the worse outcome, and reconcile yourself:
-// [Uncertain] reports exactly this case.
+// [Uncertain] reports exactly this case. It covers topic writes too,
+// whose resend can report a conflict with the change it made itself.
 func WithCautiousRetries() Option {
 	return func(c *config) { c.cautious = true }
 }

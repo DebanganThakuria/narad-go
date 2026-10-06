@@ -290,3 +290,133 @@ func TestNewRefusalsMapToTheirSentinels(t *testing.T) {
 		})
 	}
 }
+
+// outcomeUnknownReply is the 503 a 3.1.0 broker sends when the leader
+// appended a topic write and then lost its leadership: a later leader
+// may still commit it.
+const outcomeUnknownReply = "control plane temporarily unavailable: the change may still be applied, read it back before retrying: leadership lost while committing log"
+
+// topicWrites runs each topic write the way a caller would.
+var topicWrites = []struct {
+	op  string
+	run func(c *Client) error
+}{
+	{"create topic", func(c *Client) error {
+		_, err := c.CreateTopic(context.Background(), "orders")
+		return err
+	}},
+	{"set schema", func(c *Client) error {
+		_, err := c.SetSchema(context.Background(), "orders",
+			WithSchema(json.RawMessage(`{"type":"object"}`)), WithSchemaBaseVersion(1))
+		return err
+	}},
+	{"delete topic", func(c *Client) error {
+		return c.DeleteTopic(context.Background(), "orders")
+	}},
+}
+
+// A topic write the leader may still apply must not be sent again by a
+// caller who asked for cautious retries: the resend would find its own
+// change and report a conflict for a write that worked.
+func TestCautiousRetriesStopAtATopicWriteWhoseOutcomeIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range topicWrites {
+		t.Run(tc.op, func(t *testing.T) {
+			t.Parallel()
+
+			var calls atomic.Int32
+			c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) == 1 {
+					writeBrokerError(w, http.StatusServiceUnavailable, outcomeUnknownReply)
+					return
+				}
+				writeBrokerError(w, http.StatusConflict, "topic already exists")
+			}, WithRetries(3), WithCautiousRetries())
+
+			err := tc.run(c)
+			if !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("err = %v, want the uncertain ErrUnavailable", err)
+			}
+			if !Uncertain(err) {
+				t.Errorf("Uncertain(%v) = false, want true", err)
+			}
+			if got := calls.Load(); got != 1 {
+				t.Errorf("attempts = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// A topic write's 503 that does not carry the broker's own text, such as
+// a follower's forward to the leader that got no answer, is undecided
+// too, and so is the outcome-unknown text on any operation.
+func TestTopicWrite503sAreUncertain(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  *Error
+	}{
+		{"forward failure on create topic", &Error{Op: "create topic", Status: 503, Message: "forward to leader: connection reset by peer"}},
+		{"forward failure on set schema", &Error{Op: "set schema", Status: 503, Message: "no leader known"}},
+		{"forward failure on delete topic", &Error{Op: "delete topic", Status: 503}},
+		{"outcome unknown on any operation", &Error{Op: "set retention", Status: 503, Message: outcomeUnknownReply}},
+	}
+	for _, tc := range cases {
+		if !Uncertain(tc.err) || !Retryable(tc.err) {
+			t.Errorf("%s: retryable=%v uncertain=%v, want both", tc.name, Retryable(tc.err), Uncertain(tc.err))
+		}
+	}
+}
+
+// Without cautious retries the write is still retried, but the retry
+// event says it may duplicate, and a Retry-After on the uncertain 503 is
+// honoured rather than cut short by moving to another node: the change
+// may still land, and the wait gives it time to.
+func TestUncertainTopicWrite503IsRetriedAfterTheWaitItAskedFor(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	var first time.Time
+	var gap time.Duration
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			first = time.Now()
+			w.Header().Set("Retry-After", "1")
+			writeBrokerError(w, http.StatusServiceUnavailable, outcomeUnknownReply)
+			return
+		}
+		gap = time.Since(first)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"name":"orders","partitions":3}`))
+	})
+	one := httptest.NewServer(handler)
+	defer one.Close()
+	two := httptest.NewServer(handler)
+	defer two.Close()
+
+	var uncertainRetry atomic.Bool
+	c, err := New(one.URL+","+two.URL, WithRetries(2),
+		WithBackoff(time.Millisecond, time.Millisecond), WithoutBreaker(),
+		WithEvents(func(e Event) {
+			if e.Kind == EventRetry && e.Uncertain {
+				uncertainRetry.Store(true)
+			}
+		}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+
+	if _, err := c.CreateTopic(context.Background(), "orders"); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+	if !uncertainRetry.Load() {
+		t.Error("the retry event did not say the first attempt may have applied")
+	}
+	if gap < 900*time.Millisecond {
+		t.Errorf("retry gap = %s, want about the 1s the server asked for", gap)
+	}
+}

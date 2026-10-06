@@ -97,7 +97,8 @@ func WithWorkers(n int) ConsumeOption {
 //
 // Only turn it off when handlers are reliably faster than the visibility
 // timeout. Otherwise the message is redelivered underneath the handler
-// and the work is done twice.
+// and the work is done twice. With [WithBatch] the leases of a batch are
+// renewed regardless, since its messages wait on each other.
 func WithoutAutoExtend() ConsumeOption {
 	return func(c *consumeConfig) { c.autoExtend = false }
 }
@@ -126,7 +127,8 @@ func WithErrorHandler(fn func(msg *Message, err error)) ConsumeOption {
 // cannot be stopped, and waiting for it means Consume outlives the
 // grace period its orchestrator gave the process, which gets the process
 // killed and every in-flight ack lost. Abandoning the work costs one
-// redelivery instead.
+// redelivery instead; with [WithBatch], the messages the batch already
+// handled are acked as soon as shutdown begins, so that holds there too.
 func WithShutdownGrace(d time.Duration) ConsumeOption {
 	return func(c *consumeConfig) { c.grace = d }
 }
@@ -233,7 +235,8 @@ func (c *Client) Consume(ctx context.Context, topic string, h Handler, opts ...C
 	if cfg.workers < 1 {
 		cfg.workers = 1
 	}
-	if cfg.autoExtend && cfg.visibility <= 0 {
+	// A batch renews its leases whatever autoExtend says; see WithBatch.
+	if (cfg.autoExtend || cfg.batch > 1) && cfg.visibility <= 0 {
 		cfg.visibility = c.visibilityOf(ctx, topic)
 	}
 

@@ -8,13 +8,15 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 )
 
 // Operation names of the batch forms, used in errors and events.
 const (
-	opAckBatch  = "ack batch"
-	opNackBatch = "nack batch"
+	opAckBatch    = "ack batch"
+	opNackBatch   = "nack batch"
+	opExtendBatch = "extend batch"
 )
 
 // WithBatch has each [Client.Consume] worker take up to n messages per
@@ -30,9 +32,16 @@ const (
 // reported to [WithErrorHandler] as [ErrLeaseLost], just as a single ack
 // would report it. A failed message is still handed back at once.
 //
-// While a message waits its turn its lease is renewed like that of one
-// being handled, so a slow message early in a batch does not cost the
-// rest theirs. On shutdown, messages not yet started are handed back.
+// Every lease in the batch is renewed from the poll until its message
+// is settled, together, in one request per round, so a slow message
+// early in a batch does not cost the rest theirs. That holds with
+// [WithoutAutoExtend] too: it is for a handler that outruns its own
+// lease, and in a batch a message also waits for the ones ahead of it
+// and for the batch ack.
+//
+// On shutdown, the messages already handled are acked at once, so a
+// handler abandoned at the end of [WithShutdownGrace] costs only its own
+// message, and the messages not yet started are handed back.
 //
 // The trade: a message's ack goes out when its whole batch is done, not
 // when it is, so a crash mid-batch redelivers messages already handled.
@@ -91,120 +100,265 @@ func (c *Client) decodeMessages(body []byte, topic string) ([]*Message, error) {
 
 // dispatchBatch runs the handler over a batch of messages, one at a
 // time, with every lease kept alive until its message is settled, and
-// acks the successes together at the end.
+// acks the successes together at the end, or as soon as shutdown
+// begins.
 func (c *Client) dispatchBatch(pollCtx, workCtx context.Context, h Handler, msgs []*Message, cfg consumeConfig) {
-	type held struct {
-		msg    *Message
-		ctx    context.Context
-		cancel context.CancelFunc
-		keeper *leaseKeeper
-	}
-	items := make([]held, len(msgs))
-	for i, msg := range msgs {
-		ctx, cancel := context.WithCancel(workCtx)
-		items[i] = held{msg: msg, ctx: ctx, cancel: cancel}
-		if cfg.autoExtend && msg.Leased() {
-			items[i].keeper = keepLease(ctx, cancel, msg, cfg.visibility)
-		}
-	}
-	// release stops an item's renewals and reports whether its lease
-	// went away while it was held.
-	release := func(it *held) (lost bool) {
-		if it.keeper != nil {
-			it.keeper.stop()
-			lost = it.keeper.lost()
-		}
-		it.cancel()
-		return lost
-	}
+	leases := c.holdLeases(workCtx, msgs, cfg.visibility)
+	defer leases.stop()
+
 	reportLost := func(msg *Message, when string) {
 		c.report(cfg, msg, fmt.Errorf("narad: %s: %w %s", msg.describe(), ErrLeaseLost, when))
 		c.logger().Warn("narad: lease lost "+when,
 			"topic", msg.Topic, "id", msg.ID(), "offset", msg.Offset)
 	}
 
-	var succeeded, unstarted []*held
-	for i := range items {
-		it := &items[i]
+	// succeeded holds the messages handled successfully and not yet
+	// acked. Shutdown acks them from another goroutine.
+	var mu sync.Mutex
+	var succeeded []int
+	flush := func() {
+		mu.Lock()
+		held := succeeded
+		succeeded = nil
+		mu.Unlock()
+
+		// A lease lost before the ack could go out means the message is
+		// on its way to somebody else, so it is reported rather than
+		// acked.
+		var toAck []*Message
+		for _, i := range held {
+			if leases.release(i) {
+				reportLost(msgs[i], "before the ack could be sent")
+				continue
+			}
+			toAck = append(toAck, msgs[i])
+		}
+		settleCtx, cancel := settleContext(workCtx)
+		defer cancel()
+		for i, err := range c.settleMany(settleCtx, opAck, toAck) {
+			if err == nil {
+				continue
+			}
+			msg := toAck[i]
+			c.report(cfg, msg, fmt.Errorf("narad: %s: the handler succeeded but the ack failed, so the message will be redelivered: %w",
+				msg.describe(), err))
+			c.logger().Error("narad: ack failed after successful handling",
+				"topic", msg.Topic, "id", msg.ID(), "offset", msg.Offset, "err", err)
+		}
+	}
+	// Once shutdown begins, the message in hand may outlast the grace
+	// period and be abandoned, and the messages already handled must not
+	// go down with it, so they are acked at once.
+	flushed := make(chan struct{})
+	stopFlush := context.AfterFunc(pollCtx, func() {
+		defer close(flushed)
+		flush()
+	})
+
+	var unstarted []int
+	for i, msg := range msgs {
 		if pollCtx.Err() != nil {
 			// Shutting down: whatever has not started goes back now
 			// rather than when its lease lapses.
-			unstarted = append(unstarted, it)
+			unstarted = append(unstarted, i)
 			continue
 		}
-		if it.keeper != nil && it.keeper.lost() {
-			release(it)
-			reportLost(it.msg, "before the handler started")
+		if leases.lost(i) {
+			leases.release(i)
+			reportLost(msg, "before the handler started")
 			continue
 		}
 
-		err := safely(it.ctx, h, it.msg)
+		err := safely(leases.context(i), h, msg)
 
-		if !it.msg.Leased() {
-			release(it)
+		if !msg.Leased() {
+			leases.release(i)
 			continue
 		}
 		// As in dispatch, a message the handler settled itself is not
 		// settled again.
-		settled := it.msg.isSettled()
+		settled := msg.isSettled()
 		if err == nil && !settled {
-			// The lease stays renewed until the batch ack goes out.
-			succeeded = append(succeeded, it)
+			// The lease stays renewed until the ack goes out.
+			mu.Lock()
+			succeeded = append(succeeded, i)
+			mu.Unlock()
 			continue
 		}
-		if lost := release(it); lost && !settled {
-			reportLost(it.msg, "while the handler was still running")
+		if lost := leases.release(i); lost && !settled {
+			reportLost(msg, "while the handler was still running")
 			continue
 		}
 		if err == nil {
 			continue
 		}
-		c.report(cfg, it.msg, err)
+		c.report(cfg, msg, err)
 		c.logger().Warn("narad: handler failed",
-			"topic", it.msg.Topic, "id", it.msg.ID(), "offset", it.msg.Offset,
+			"topic", msg.Topic, "id", msg.ID(), "offset", msg.Offset,
 			"requeued", cfg.requeue && !settled, "err", err)
 		if cfg.requeue && !settled {
 			settleCtx, cancel := settleContext(workCtx)
-			c.handBack(settleCtx, it.msg)
+			c.handBack(settleCtx, msg)
 			cancel()
 		}
 	}
 
-	settleCtx, cancel := settleContext(workCtx)
-	defer cancel()
-
-	// A lease lost before the ack could go out means the message is on
-	// its way to somebody else, so it is reported rather than acked.
-	var toAck []*Message
-	for _, it := range succeeded {
-		if release(it) {
-			reportLost(it.msg, "before the ack could be sent")
-			continue
-		}
-		toAck = append(toAck, it.msg)
+	if !stopFlush() {
+		<-flushed
 	}
-	for i, err := range c.settleMany(settleCtx, opAck, toAck) {
-		if err == nil {
-			continue
-		}
-		msg := toAck[i]
-		c.report(cfg, msg, fmt.Errorf("narad: %s: the handler succeeded but the ack failed, so the message will be redelivered: %w",
-			msg.describe(), err))
-		c.logger().Error("narad: ack failed after successful handling",
-			"topic", msg.Topic, "id", msg.ID(), "offset", msg.Offset, "err", err)
-	}
+	flush()
 
 	var toHandBack []*Message
-	for _, it := range unstarted {
-		if !release(it) {
-			toHandBack = append(toHandBack, it.msg)
+	for _, i := range unstarted {
+		if !leases.release(i) {
+			toHandBack = append(toHandBack, msgs[i])
 		}
 	}
+	settleCtx, cancel := settleContext(workCtx)
+	defer cancel()
 	for i, err := range c.settleMany(settleCtx, opNack, toHandBack) {
 		if err != nil {
 			c.logger().Warn("narad: could not hand an unstarted message back, it will wait out its visibility timeout",
 				"topic", toHandBack[i].Topic, "id", toHandBack[i].ID(), "err", err)
 		}
+	}
+}
+
+// batchLeases keeps the leases of a batch alive, with one extend request
+// per round for all of them rather than one per message, until each
+// message is released.
+//
+// Every lease is renewed, whatever [WithoutAutoExtend] says. That option
+// is for a handler that reliably outruns its own lease, but in a batch a
+// message also waits for the ones ahead of it and for the batch ack,
+// which no handler's speed bounds.
+type batchLeases struct {
+	client *Client
+	items  []batchLease
+	// mu guards the items' held and gone flags.
+	mu sync.Mutex
+	// round is held for the whole of a renewal round, so a release can
+	// wait out the round that may be renewing its message.
+	round    sync.Mutex
+	done     chan struct{}
+	finished chan struct{}
+}
+
+// batchLease is one message's lease within a batch.
+type batchLease struct {
+	msg    *Message
+	ctx    context.Context
+	cancel context.CancelFunc
+	// held is true while the lease is being renewed.
+	held bool
+	// gone is set when a renewal found the lease lost.
+	gone bool
+}
+
+// holdLeases starts renewing the leases of msgs every third of the
+// visibility timeout, as keepLease does for one message.
+func (c *Client) holdLeases(ctx context.Context, msgs []*Message, visibility time.Duration) *batchLeases {
+	l := &batchLeases{
+		client:   c,
+		items:    make([]batchLease, len(msgs)),
+		done:     make(chan struct{}),
+		finished: make(chan struct{}),
+	}
+	for i, msg := range msgs {
+		itemCtx, cancel := context.WithCancel(ctx)
+		l.items[i] = batchLease{msg: msg, ctx: itemCtx, cancel: cancel, held: msg.Leased()}
+	}
+	every := max(visibility/3, time.Second)
+	go func() {
+		defer close(l.finished)
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-l.done:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				l.renew(ctx)
+			}
+		}
+	}()
+	return l
+}
+
+// renew extends every lease still held, in one request, and marks the
+// ones the broker says are gone.
+func (l *batchLeases) renew(ctx context.Context) {
+	l.round.Lock()
+	defer l.round.Unlock()
+
+	var index []int
+	var msgs []*Message
+	l.mu.Lock()
+	for i := range l.items {
+		// A message its handler settled has no lease left to renew,
+		// and a 410 for it would not mean it was lost.
+		if it := &l.items[i]; it.held && !it.msg.isSettled() {
+			index = append(index, i)
+			msgs = append(msgs, it.msg)
+		}
+	}
+	l.mu.Unlock()
+	if len(msgs) == 0 {
+		return
+	}
+
+	extendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	for j, err := range l.client.settleMany(extendCtx, opExtend, msgs) {
+		// Any other failure is not proof the lease is gone, and the
+		// next round is still inside the window.
+		if !errorIs(err, ErrLeaseLost) || msgs[j].isSettled() {
+			continue
+		}
+		it := &l.items[index[j]]
+		l.mu.Lock()
+		it.held, it.gone = false, true
+		l.mu.Unlock()
+		// The message is back in the queue and may already be running
+		// somewhere else, so its handler is told to stop.
+		it.cancel()
+	}
+}
+
+// context is the context the handler of message i runs under. It is
+// cancelled when the lease is lost or the message released.
+func (l *batchLeases) context(i int) context.Context { return l.items[i].ctx }
+
+// lost reports whether message i's lease went away while it was held.
+func (l *batchLeases) lost(i int) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.items[i].gone
+}
+
+// release stops renewing message i's lease, once any round renewing it
+// has finished, and reports whether the lease went away while it was
+// held.
+func (l *batchLeases) release(i int) (lost bool) {
+	l.round.Lock()
+	l.mu.Lock()
+	it := &l.items[i]
+	it.held = false
+	lost = it.gone
+	l.mu.Unlock()
+	l.round.Unlock()
+	it.cancel()
+	return lost
+}
+
+// stop ends the renewals and waits for them to finish.
+func (l *batchLeases) stop() {
+	close(l.done)
+	<-l.finished
+	for i := range l.items {
+		l.items[i].cancel()
 	}
 }
 
@@ -215,17 +369,17 @@ func settleContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 }
 
-// settleMany acks or nacks messages of one topic, with one request per
+// settleMany acks, nacks or extends messages of one topic, with one request per
 // round instead of one per message, and returns each message's outcome
 // in order.
 //
 // The broker settles every receipt handle on its own and answers with
 // the status a single ack of it would have got, so each message is
-// treated exactly as [Message.Ack] or [Message.Nack] would treat it:
-// 204 settles it, a retryable status is tried again, and a 410 is
-// [ErrLeaseLost] unless an earlier round for that message may have
-// landed, when, as for a single ack, it means that round spent the
-// handle. A broker that refuses the batch form gets one request per
+// treated exactly as [Message.Ack], [Message.Nack] or [Message.Extend]
+// would treat it: 204 settles it, a retryable status is tried again,
+// and a 410 is [ErrLeaseLost] unless an earlier round of an ack for that
+// message may have landed, when, as for a single ack, it means that
+// round spent the handle. A broker that refuses the batch form gets one request per
 // message instead.
 func (c *Client) settleMany(ctx context.Context, op string, msgs []*Message) []error {
 	errs := make([]error, len(msgs))
@@ -234,9 +388,13 @@ func (c *Client) settleMany(ctx context.Context, op string, msgs []*Message) []e
 	}
 	extra := map[string]string(nil)
 	batchOp := opAckBatch
-	if op == opNack {
+	switch op {
+	case opNack:
 		extra = map[string]string{"extend": "0"}
 		batchOp = opNackBatch
+	case opExtend:
+		extra = map[string]string{"extend": "true"}
+		batchOp = opExtendBatch
 	}
 	if len(msgs) == 1 {
 		errs[0] = msgs[0].settle(ctx, op, extra)

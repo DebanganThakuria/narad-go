@@ -19,7 +19,8 @@ import (
 // broker does (handlers/messaging/consume_batch.go and ack_batch.go):
 // GET /consume?max=N answers {"messages":[...]} or 204 and refuses a
 // request without X-Narad-Client; POST /ack with a receipt_handles body
-// answers 200 with one {"status","error"} per handle, in order.
+// answers 200 with one {"status","error"} per handle, in order, for an
+// ack, a nack (extend=0) or an extend (extend=true) alike.
 type batchConsumeBroker struct {
 	mu           sync.Mutex
 	pending      []*Message
@@ -45,6 +46,7 @@ type batchConsumeBroker struct {
 	maxes        []string
 	batchAcks    [][]string // the handles of each batch ack, by request
 	batchNacks   [][]string
+	batchExtends [][]string
 	singleAcks   []string
 	singleNacks  []string
 	extended     []string
@@ -142,15 +144,25 @@ func (b *batchConsumeBroker) handler() http.HandlerFunc {
 				writeBrokerError(w, http.StatusBadRequest, "receipt_handles required")
 				return
 			}
-			if extend == "0" {
+			switch extend {
+			case "0":
 				b.batchNacks = append(b.batchNacks, body.Handles)
-			} else {
+			case "true":
+				b.batchExtends = append(b.batchExtends, body.Handles)
+				b.extended = append(b.extended, body.Handles...)
+			default:
 				b.batchAcks = append(b.batchAcks, body.Handles)
 			}
 			results := make([]map[string]any, len(body.Handles))
 			for i, handle := range body.Handles {
 				status := http.StatusNoContent
-				if extend != "0" {
+				switch extend {
+				case "0":
+				case "true":
+					if s := b.extendStatus[handle]; s != 0 {
+						status = s
+					}
+				default:
 					status = b.settle(handle)
 				}
 				results[i] = map[string]any{"status": status}
@@ -158,11 +170,11 @@ func (b *batchConsumeBroker) handler() http.HandlerFunc {
 					results[i]["error"] = "receipt handle is no longer valid"
 				}
 			}
-			if b.failFirstBatchAck && len(b.batchAcks) == 1 && extend != "0" {
+			if b.failFirstBatchAck && len(b.batchAcks) == 1 && extend == "" {
 				writeBrokerError(w, http.StatusInternalServerError, "ack failed")
 				return
 			}
-			if b.garbleFirstBatchAck != nil && len(b.batchAcks) == 1 && extend != "0" {
+			if b.garbleFirstBatchAck != nil && len(b.batchAcks) == 1 && extend == "" {
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = io.WriteString(w, *b.garbleFirstBatchAck)
 				return
@@ -721,4 +733,118 @@ func TestRenewalsStopOnceTheHandlerSettles(t *testing.T) {
 	if errs := log.of("1:1:9"); len(errs) != 0 {
 		t.Errorf("reported %v, want nothing", errs)
 	}
+}
+
+// A batch's leases are renewed together, in one request per round, not
+// one request per message.
+func TestBatchRenewsEveryLeaseInOneRequest(t *testing.T) {
+	t.Parallel()
+
+	b := &batchConsumeBroker{visibilityMs: 3_000} // renews every second
+	b.queue(msgAt(1, "1:1:9"), msgAt(2, "1:2:9"), msgAt(3, "1:3:9"))
+	c := newBatchConsumeClient(t, b)
+	release := make(chan struct{})
+	consumeInBackground(t, c, func(_ context.Context, msg *Message) error {
+		if msg.Offset == 1 {
+			<-release
+		}
+		return nil
+	}, WithBatch(3))
+
+	waitFor(t, func() bool {
+		var n int
+		b.snapshot(func(b *batchConsumeBroker) { n = len(b.extended) })
+		return n > 0
+	}, "a renewal")
+	close(release)
+	waitFor(t, func() bool {
+		var acks int
+		b.snapshot(func(b *batchConsumeBroker) { acks = len(b.acked) })
+		return acks == 3
+	}, "the batch to be acked")
+	b.snapshot(func(b *batchConsumeBroker) {
+		if len(b.batchExtends) == 0 || len(b.batchExtends[0]) != 3 {
+			t.Errorf("batch extends = %v, want each round to carry all three handles", b.batchExtends)
+		}
+		if singles := len(b.extended) - countHandles(b.batchExtends); singles != 0 {
+			t.Errorf("%d single extends, want none", singles)
+		}
+	})
+}
+
+func countHandles(requests [][]string) int {
+	n := 0
+	for _, handles := range requests {
+		n += len(handles)
+	}
+	return n
+}
+
+// WithoutAutoExtend is about a handler outrunning its own lease. In a
+// batch, messages also wait for the ones ahead of them and for the
+// batch ack, which no handler's speed bounds, so their leases are still
+// renewed.
+func TestBatchRenewsLeasesWithoutAutoExtend(t *testing.T) {
+	t.Parallel()
+
+	b := &batchConsumeBroker{visibilityMs: 3_000} // renews every second
+	b.queue(msgAt(1, "1:1:9"), msgAt(2, "1:2:9"))
+	c := newBatchConsumeClient(t, b)
+	release := make(chan struct{})
+	consumeInBackground(t, c, func(_ context.Context, msg *Message) error {
+		if msg.Offset == 1 {
+			<-release
+		}
+		return nil
+	}, WithBatch(2), WithoutAutoExtend())
+
+	waitFor(t, func() bool {
+		renewed := false
+		b.snapshot(func(b *batchConsumeBroker) {
+			for _, handle := range b.extended {
+				renewed = renewed || handle == "1:2:9"
+			}
+		})
+		return renewed
+	}, "the waiting message's lease to be renewed")
+	close(release)
+	waitFor(t, func() bool {
+		var acks int
+		b.snapshot(func(b *batchConsumeBroker) { acks = len(b.acked) })
+		return acks == 2
+	}, "both messages to be acked")
+}
+
+// A handler abandoned at the end of the shutdown grace must not take the
+// acks of the messages its batch already finished down with it: those
+// are acked as soon as shutdown begins.
+func TestBatchAcksFinishedMessagesWhenShutdownBegins(t *testing.T) {
+	t.Parallel()
+
+	b := &batchConsumeBroker{}
+	b.queue(msgAt(1, "1:1:9"), msgAt(2, "1:2:9"), msgAt(3, "1:3:9"))
+	c := newBatchConsumeClient(t, b)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	stop := consumeInBackground(t, c, func(_ context.Context, msg *Message) error {
+		if msg.Offset == 2 {
+			close(started)
+			<-release // deliberately ignores cancellation
+		}
+		return nil
+	}, WithBatch(3), WithShutdownGrace(100*time.Millisecond))
+	t.Cleanup(func() { close(release) })
+
+	<-started
+	stop()
+	waitFor(t, func() bool {
+		var acked bool
+		b.snapshot(func(b *batchConsumeBroker) { acked = b.acked["1:1:9"] })
+		return acked
+	}, "the finished message to be acked")
+	b.snapshot(func(b *batchConsumeBroker) {
+		if b.acked["1:2:9"] {
+			t.Error("the abandoned message was acked")
+		}
+	})
 }

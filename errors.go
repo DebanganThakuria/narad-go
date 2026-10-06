@@ -14,7 +14,8 @@ var (
 	// ErrBadRequest means the server rejected the request as malformed.
 	// Sending it again unchanged will fail the same way. Among the
 	// reasons: a payload nested deeper than 256 levels on a topic with a
-	// schema, a new topic name over 200 bytes, and an empty batch.
+	// schema, a new topic name over 200 bytes, an empty batch, and a
+	// produce to a delayed fan-out child, which only its parent feeds.
 	ErrBadRequest = errors.New("narad: bad request")
 
 	// ErrUnauthenticated means the credentials were missing or wrong.
@@ -271,6 +272,12 @@ func errorKind(status int, message string) error {
 		return kinds{ErrNameTaken, ErrExists}
 	case strings.Contains(message, "topic changed since it was read"):
 		return kinds{ErrTopicChanged, ErrExists}
+	case strings.Contains(message, "delayed child topic is not allowed"):
+		// A delayed child is fed only by its parent. Nothing about the
+		// produce already exists, and sending it again will be refused
+		// the same way, so it must not read as the conflict EnsureTopic
+		// takes for success.
+		return ErrBadRequest
 	}
 	return kind
 }

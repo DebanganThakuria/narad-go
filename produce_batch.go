@@ -159,6 +159,8 @@ func batchElement(payload []byte, contentType string, cfg produceConfig) []byte 
 //
 // A broker older than 3.1.0 has no batch endpoint and answers
 // [ErrNotFound]. Fall back to Produce there, knowing it is not atomic.
+// As with Produce, a batch sent to a delayed fan-out child is refused
+// with [ErrBadRequest].
 func (c *Client) ProduceBatch(ctx context.Context, topic string, batch *Batch) error {
 	if topic == "" {
 		return fmt.Errorf("narad: produce batch: %w: topic is required", ErrBadRequest)

@@ -62,6 +62,9 @@ func WithPartition(partition int) ProduceOption {
 // On an error, ask [Uncertain]. A produce whose reply was lost may still
 // be committed, and the default retry policy will already have tried
 // again, which can duplicate. Consumers have to be idempotent anyway.
+//
+// A delayed fan-out child takes messages only from its parent, so a
+// produce to one is refused with [ErrBadRequest]; produce to the parent.
 func (c *Client) Produce(ctx context.Context, topic string, value any, opts ...ProduceOption) error {
 	if topic == "" {
 		return fmt.Errorf("narad: produce: %w: topic is required", ErrBadRequest)

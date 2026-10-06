@@ -420,3 +420,45 @@ func TestUncertainTopicWrite503IsRetriedAfterTheWaitItAskedFor(t *testing.T) {
 		t.Errorf("retry gap = %s, want about the 1s the server asked for", gap)
 	}
 }
+
+// A produce to a delayed fan-out child is refused with 409, but nothing
+// about it already exists: it will be refused however often it is sent,
+// so it must not read as the benign conflict EnsureTopic treats as
+// success.
+func TestProduceToADelayedChildIsABadRequest(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		message string
+		send    func(c *Client) error
+	}{
+		{"produce", "direct produce to a delayed child topic is not allowed", func(c *Client) error {
+			return c.Produce(context.Background(), "orders-delayed", map[string]int{"a": 1})
+		}},
+		{"produce batch", "direct produce to a delayed child topic is not allowed", func(c *Client) error {
+			var batch Batch
+			_ = batch.Add(order{ID: "o1"})
+			return c.ProduceBatch(context.Background(), "orders-delayed", &batch)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				writeBrokerError(w, http.StatusConflict, tc.message)
+			})
+
+			err := tc.send(c)
+			if !errors.Is(err, ErrBadRequest) {
+				t.Errorf("err = %v, want ErrBadRequest", err)
+			}
+			if errors.Is(err, ErrExists) {
+				t.Errorf("err = %v, should not match ErrExists", err)
+			}
+			if Retryable(err) {
+				t.Errorf("err = %v, should not be retryable", err)
+			}
+		})
+	}
+}

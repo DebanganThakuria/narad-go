@@ -51,6 +51,7 @@ type consumeConfig struct {
 	requeue    bool
 	onError    func(*Message, error)
 	grace      time.Duration
+	batch      int
 }
 
 func consumeDefaults() consumeConfig {
@@ -84,8 +85,9 @@ func FromPartition(partition int) ConsumeOption {
 // It defaults to one.
 //
 // Each worker runs its own poll, because the broker hands out one
-// message per request. Raising this raises the connections held open, so
-// see [WithIdleConnections] if you go far above the default.
+// message per request unless [WithBatch] asks for more. Raising this
+// raises the connections held open, so see [WithIdleConnections] if you
+// go far above the default.
 func WithWorkers(n int) ConsumeOption {
 	return func(c *consumeConfig) { c.workers = n }
 }
@@ -293,7 +295,7 @@ func (c *Client) visibilityOf(ctx context.Context, topic string) time.Duration {
 func (c *Client) worker(pollCtx, workCtx context.Context, topic string, h Handler, cfg consumeConfig) {
 	failures := 0
 	for pollCtx.Err() == nil {
-		msg, err := c.poll(pollCtx, topic, cfg)
+		msgs, err := c.pollMany(pollCtx, topic, cfg)
 		if err != nil {
 			if pollCtx.Err() != nil || errors.Is(err, ErrClosed) {
 				return
@@ -311,10 +313,26 @@ func (c *Client) worker(pollCtx, workCtx context.Context, topic string, h Handle
 			continue
 		}
 		failures = 0
-		if msg != nil {
-			c.dispatch(workCtx, h, msg, cfg)
+		switch {
+		case len(msgs) == 1:
+			c.dispatch(workCtx, h, msgs[0], cfg)
+		case len(msgs) > 1:
+			c.dispatchBatch(pollCtx, workCtx, h, msgs, cfg)
 		}
 	}
+}
+
+// pollMany asks once for messages: up to the batch size with
+// [WithBatch], else one.
+func (c *Client) pollMany(ctx context.Context, topic string, cfg consumeConfig) ([]*Message, error) {
+	if cfg.batch > 1 {
+		return c.pollBatch(ctx, topic, cfg)
+	}
+	msg, err := c.poll(ctx, topic, cfg)
+	if msg == nil || err != nil {
+		return nil, err
+	}
+	return []*Message{msg}, nil
 }
 
 // poll asks once for a message. It returns nil, nil when the wait
@@ -323,30 +341,7 @@ func (c *Client) poll(ctx context.Context, topic string, cfg consumeConfig) (*Me
 	if topic == "" {
 		return nil, fmt.Errorf("narad: consume: %w: topic is required", ErrBadRequest)
 	}
-	query := url.Values{}
-	if cfg.wait > 0 {
-		query.Set("wait", cfg.wait.String())
-	}
-	if cfg.pinned {
-		query.Set("partition", strconv.Itoa(cfg.partition))
-	}
-
-	// The request has to outlive the poll the server was asked to hold,
-	// plus the round trip. The configured timeout would cancel it.
-	timeout := c.cfg.timeout
-	if cfg.wait > 0 {
-		timeout = cfg.wait + 10*time.Second
-	}
-
-	res, err := c.do(ctx, call{
-		method:  http.MethodGet,
-		path:    "/v1/topics/" + url.PathEscape(topic) + "/consume",
-		query:   query.Encode(),
-		op:      opConsume,
-		topic:   topic,
-		ok:      []int{http.StatusOK, http.StatusNoContent},
-		timeout: timeout,
-	})
+	res, err := c.do(ctx, consumeCall(topic, cfg, nil, c.cfg.timeout))
 	if err != nil {
 		return nil, err
 	}
@@ -354,6 +349,35 @@ func (c *Client) poll(ctx context.Context, topic string, cfg consumeConfig) (*Me
 		return nil, nil
 	}
 	return c.decodeMessage(res.body, topic)
+}
+
+// consumeCall builds a queue-style consume, with extra query parameters
+// on top of the wait and the partition.
+func consumeCall(topic string, cfg consumeConfig, extra url.Values, timeout time.Duration) call {
+	query := url.Values{}
+	for name, values := range extra {
+		query[name] = values
+	}
+	if cfg.wait > 0 {
+		query.Set("wait", cfg.wait.String())
+	}
+	if cfg.pinned {
+		query.Set("partition", strconv.Itoa(cfg.partition))
+	}
+	// The request has to outlive the poll the server was asked to hold,
+	// plus the round trip. The configured timeout would cancel it.
+	if cfg.wait > 0 {
+		timeout = cfg.wait + 10*time.Second
+	}
+	return call{
+		method:  http.MethodGet,
+		path:    "/v1/topics/" + url.PathEscape(topic) + "/consume",
+		query:   query.Encode(),
+		op:      opConsume,
+		topic:   topic,
+		ok:      []int{http.StatusOK, http.StatusNoContent},
+		timeout: timeout,
+	}
 }
 
 func (c *Client) decodeMessage(body []byte, topic string) (*Message, error) {
@@ -383,7 +407,10 @@ func (c *Client) dispatch(ctx context.Context, h Handler, msg *Message, cfg cons
 	if !msg.Leased() {
 		return
 	}
-	if keeper != nil && keeper.lost() {
+	// A handler may settle its message itself. Settling it again would
+	// find the receipt spent and report a failure that did not happen.
+	settled := msg.isSettled()
+	if !settled && keeper != nil && keeper.lost() {
 		// The message is already back in the queue. Acking now would
 		// either fail or settle a lease somebody else is holding.
 		lost := fmt.Errorf("narad: %s: %w while the handler was still running", msg.describe(), ErrLeaseLost)
@@ -396,20 +423,20 @@ func (c *Client) dispatch(ctx context.Context, h Handler, msg *Message, cfg cons
 	// Finishing the settle matters more than shutting down promptly: an
 	// ack dropped here becomes a redelivery of work already done. Give
 	// it its own short deadline so it cannot hang.
-	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	settleCtx, cancelSettle := settleContext(ctx)
 	defer cancelSettle()
 
 	if err != nil {
 		c.report(cfg, msg, err)
 		c.logger().Warn("narad: handler failed",
 			"topic", msg.Topic, "id", msg.ID(), "offset", msg.Offset,
-			"requeued", cfg.requeue, "err", err)
-		if cfg.requeue {
-			if nackErr := msg.Nack(settleCtx); nackErr != nil {
-				c.logger().Warn("narad: could not hand the message back, it will wait out its visibility timeout",
-					"topic", msg.Topic, "id", msg.ID(), "err", nackErr)
-			}
+			"requeued", cfg.requeue && !settled, "err", err)
+		if cfg.requeue && !settled {
+			c.handBack(settleCtx, msg)
 		}
+		return
+	}
+	if settled {
 		return
 	}
 	if ackErr := msg.Ack(settleCtx); ackErr != nil {
@@ -418,6 +445,14 @@ func (c *Client) dispatch(ctx context.Context, h Handler, msg *Message, cfg cons
 		c.report(cfg, msg, wrapped)
 		c.logger().Error("narad: ack failed after successful handling",
 			"topic", msg.Topic, "id", msg.ID(), "offset", msg.Offset, "err", ackErr)
+	}
+}
+
+// handBack nacks a failed message so it is redelivered at once.
+func (c *Client) handBack(ctx context.Context, msg *Message) {
+	if err := msg.Nack(ctx); err != nil {
+		c.logger().Warn("narad: could not hand the message back, it will wait out its visibility timeout",
+			"topic", msg.Topic, "id", msg.ID(), "err", err)
 	}
 }
 
@@ -473,13 +508,18 @@ func keepLease(ctx context.Context, cancelHandler context.CancelFunc, msg *Messa
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				if msg.isSettled() {
+					// The handler settled it; there is no lease left
+					// to renew, and a 410 now would not mean it was lost.
+					return
+				}
 				extendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 				err := msg.Extend(extendCtx)
 				cancel()
 				if err == nil {
 					continue
 				}
-				if errorIs(err, ErrLeaseLost) {
+				if errorIs(err, ErrLeaseLost) && !msg.isSettled() {
 					close(k.gone)
 					cancelHandler()
 					return

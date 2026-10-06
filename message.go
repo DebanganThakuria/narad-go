@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -50,6 +51,11 @@ type Message struct {
 	Timestamp int64 `json:"timestamp"`
 
 	client *Client
+	// settled is set once an Ack or Nack has succeeded, so a consumer
+	// does not settle again a message its handler already settled.
+	// Read and written with sync/atomic; a plain field rather than an
+	// atomic.Bool, which would make copying a Message a vet error.
+	settled uint32
 	// env caches the decoded envelope, so the id is cheap to put in
 	// every error and log line without re-parsing the payload.
 	env        *Envelope
@@ -141,6 +147,11 @@ func (m *Message) Time() time.Time {
 // Leased reports whether the message holds a lease that must be settled.
 // Messages from [Client.ReadAt] do not.
 func (m *Message) Leased() bool { return m.Receipt != "" }
+
+// isSettled reports whether an Ack or Nack of the message has succeeded.
+func (m *Message) isSettled() bool { return atomic.LoadUint32(&m.settled) == 1 }
+
+func (m *Message) markSettled() { atomic.StoreUint32(&m.settled, 1) }
 
 // Into decodes the message into v.
 //
@@ -248,6 +259,13 @@ func (m *Message) Extend(ctx context.Context) error {
 
 // settle performs an ack-family request.
 func (m *Message) settle(ctx context.Context, op string, extra map[string]string) error {
+	return m.settleFrom(ctx, op, extra, false)
+}
+
+// settleFrom is settle for a caller that may already have sent this
+// settle once in a way that could have landed, as a batch ack whose
+// reply was lost has.
+func (m *Message) settleFrom(ctx context.Context, op string, extra map[string]string, mayHaveLanded bool) error {
 	if m.client == nil {
 		return fmt.Errorf("narad: %s: %w: message did not come from a client", op, ErrBadRequest)
 	}
@@ -277,17 +295,18 @@ func (m *Message) settle(ctx context.Context, op string, extra map[string]string
 		attempts = 1
 	}
 	var last error
-	mayHaveLanded := false
 
 	for attempt := range attempts {
 		_, err := client.do(ctx, rc)
 		if err == nil {
+			m.settledBy(op)
 			return nil
 		}
 		// Only an ack earns this. A 410 after an attempt that may have
 		// reached the owner means the receipt was spent, and the most
 		// likely thing to have spent it is that attempt.
 		if op == opAck && mayHaveLanded && errorIs(err, ErrLeaseLost) {
+			m.settledBy(op)
 			return nil
 		}
 		last = err
@@ -305,4 +324,12 @@ func (m *Message) settle(ctx context.Context, op string, extra map[string]string
 		}
 	}
 	return last
+}
+
+// settledBy records a successful settle. An extend keeps the lease, so
+// only an ack or a nack settles the message.
+func (m *Message) settledBy(op string) {
+	if op == opAck || op == opNack {
+		m.markSettled()
+	}
 }

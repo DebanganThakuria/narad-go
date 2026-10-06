@@ -23,12 +23,13 @@ const MaxMessageBytes = 1 << 20
 
 // Operation names, used in errors and in the event stream.
 const (
-	opProduce = "produce"
-	opConsume = "consume"
-	opRead    = "read"
-	opAck     = "ack"
-	opNack    = "nack"
-	opExtend  = "extend"
+	opProduce      = "produce"
+	opProduceBatch = "produce batch"
+	opConsume      = "consume"
+	opRead         = "read"
+	opAck          = "ack"
+	opNack         = "nack"
+	opExtend       = "extend"
 )
 
 const (

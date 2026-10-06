@@ -14,7 +14,7 @@ var (
 	// ErrBadRequest means the server rejected the request as malformed.
 	// Sending it again unchanged will fail the same way. Among the
 	// reasons: a payload nested deeper than 256 levels on a topic with a
-	// schema, and a new topic name over 200 bytes.
+	// schema, a new topic name over 200 bytes, and an empty batch.
 	ErrBadRequest = errors.New("narad: bad request")
 
 	// ErrUnauthenticated means the credentials were missing or wrong.
@@ -215,7 +215,7 @@ func Uncertain(err error) bool {
 			// decommissioned, a busy schema validator), but the status
 			// alone cannot tell those from the one that may have
 			// stored the message, so every produce 503 counts.
-			return apiErr.Op == opProduce
+			return apiErr.Op == opProduce || apiErr.Op == opProduceBatch
 		}
 	}
 	return false

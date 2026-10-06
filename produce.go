@@ -66,34 +66,10 @@ func (c *Client) Produce(ctx context.Context, topic string, value any, opts ...P
 	if topic == "" {
 		return fmt.Errorf("narad: produce: %w: topic is required", ErrBadRequest)
 	}
-	var cfg produceConfig
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-
-	payload, contentType, err := encode(value)
+	cfg := produceOptions(opts)
+	payload, contentType, err := encodeMessage(value, cfg)
 	if err != nil {
 		return fmt.Errorf("narad: produce %s: %w", topic, err)
-	}
-	if len(payload) == 0 {
-		return fmt.Errorf("narad: produce %s: %w: message is empty", topic, ErrBadRequest)
-	}
-	if cfg.envelope {
-		if contentType != "application/json" {
-			// The envelope is JSON, so the message inside it has to be
-			// too. Wrapping raw bytes would produce a body that is not
-			// valid JSON and the broker would reject it.
-			return fmt.Errorf("narad: produce %s: %w: an envelope needs a JSON message, not raw bytes",
-				topic, ErrBadRequest)
-		}
-		payload, err = wrap(payload, cfg)
-		if err != nil {
-			return fmt.Errorf("narad: produce %s: %w", topic, err)
-		}
-	}
-	if len(payload) > MaxMessageBytes {
-		return fmt.Errorf("narad: produce %s: %w: %d bytes, limit is %d",
-			topic, ErrTooLarge, len(payload), MaxMessageBytes)
 	}
 
 	query := url.Values{}
@@ -115,6 +91,42 @@ func (c *Client) Produce(ctx context.Context, topic string, value any, opts ...P
 		ok:          []int{http.StatusAccepted},
 	})
 	return err
+}
+
+func produceOptions(opts []ProduceOption) produceConfig {
+	var cfg produceConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg
+}
+
+// encodeMessage turns a value into the body to store and its content
+// type, wrapped in an envelope when the options ask for one.
+func encodeMessage(value any, cfg produceConfig) ([]byte, string, error) {
+	payload, contentType, err := encode(value)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(payload) == 0 {
+		return nil, "", fmt.Errorf("%w: message is empty", ErrBadRequest)
+	}
+	if cfg.envelope {
+		if contentType != "application/json" {
+			// The envelope is JSON, so the message inside it has to be
+			// too. Wrapping raw bytes would produce a body that is not
+			// valid JSON and the broker would reject it.
+			return nil, "", fmt.Errorf("%w: an envelope needs a JSON message, not raw bytes", ErrBadRequest)
+		}
+		payload, err = wrap(payload, cfg)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	if len(payload) > MaxMessageBytes {
+		return nil, "", fmt.Errorf("%w: %d bytes, limit is %d", ErrTooLarge, len(payload), MaxMessageBytes)
+	}
+	return payload, contentType, nil
 }
 
 // encode turns a value into a body and its content type.

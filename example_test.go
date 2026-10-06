@@ -236,4 +236,67 @@ func ExampleWithCautiousRetries() {
 	}
 }
 
+// A batch is stored all or none, in one request. Fill it until it says
+// it is full, send it, and start another.
+func ExampleClient_ProduceBatch() {
+	client, _ := narad.New("localhost:7942")
+	defer client.Close()
+	ctx := context.Background()
+
+	orders := []Order{{ID: "ord_1", Amount: 4999}, {ID: "ord_2", Amount: 1250}}
+
+	var batch narad.Batch
+	for _, order := range orders {
+		err := batch.Add(order, narad.WithKey(order.ID))
+		if errors.Is(err, narad.ErrBatchFull) {
+			if _, err := client.ProduceBatch(ctx, "orders", &batch); err != nil {
+				log.Fatal(err)
+			}
+			batch = narad.Batch{}
+			err = batch.Add(order, narad.WithKey(order.ID))
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	if _, err := client.ProduceBatch(ctx, "orders", &batch); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// WithBatch cuts the requests a busy consumer makes: each worker takes
+// up to 50 messages at once and acks its successes together. The
+// handler does not change.
+func ExampleWithBatch() {
+	client, _ := narad.New("localhost:7942")
+	defer client.Close()
+
+	err := client.Consume(context.Background(), "orders", narad.HandlerFunc(
+		func(ctx context.Context, msg *narad.Message) error {
+			var order Order
+			if err := msg.Into(&order); err != nil {
+				return nil
+			}
+			return process(ctx, order)
+		}),
+		narad.WithBatch(50),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+// Keep a topic's records forever, whatever the operator's default.
+func ExampleWithRetentionForever() {
+	client, _ := narad.New("localhost:7942")
+	defer client.Close()
+
+	_, err := client.EnsureTopic(context.Background(), "ledger",
+		narad.WithPartitionCount(6),
+		narad.WithRetentionForever())
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
 func process(ctx context.Context, order Order) error { return nil }

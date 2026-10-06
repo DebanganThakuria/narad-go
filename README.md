@@ -68,6 +68,7 @@ client, err := narad.New("n1:7942,n2:7942,n3:7942",
 
 err = client.Consume(ctx, "orders", handler,
     narad.WithWorkers(16),
+    narad.WithBatch(50),
     narad.WithWait(10*time.Second),
     narad.WithErrorHandler(func(msg *narad.Message, err error) { ... }),
 )
@@ -76,6 +77,36 @@ err = client.Consume(ctx, "orders", handler,
 Give it every node you have, comma separated. The client spreads work
 across them and routes around the ones that are failing, which is what
 makes a node restart invisible to your code.
+
+## Batches
+
+When many messages go at once, a batch stores up to 100 of them in one
+request, all or none:
+
+```go
+var batch narad.Batch
+for _, order := range orders {
+    if err := batch.Add(order, narad.WithKey(order.Customer)); err != nil {
+        return err // narad.ErrBatchFull past 100 messages or 1 MiB
+    }
+}
+accepted, err := client.ProduceBatch(ctx, "orders", &batch)
+```
+
+`Add` takes what `Produce` takes, per message. If the broker refuses one
+message, nothing is stored and the error names it (`message 3: ...`).
+A lost reply is uncertain for the whole batch, exactly as for one
+produce, and envelope ids are fixed when a message is added, so a batch
+sent again carries the same ids.
+
+On the consuming side, `WithBatch(n)` has each worker take up to `n`
+messages per request and ack its successes together. The handler does
+not change: it still sees one message at a time, every lease is renewed
+while its message waits, a failure is handed back at once, and each
+message's ack outcome is reported on its own, a lost lease included.
+
+Both need Narad 3.1.0. An older broker answers `ProduceBatch` with
+`ErrNotFound`; a consumer with `WithBatch` falls back to one at a time.
 
 ## Envelopes
 
@@ -136,9 +167,14 @@ errors.Is(err, narad.ErrNotFound) // which assumption was wrong
 ```
 
 `ErrBadRequest`, `ErrUnauthenticated`, `ErrForbidden`, `ErrNotFound`,
-`ErrExists`, `ErrLeaseLost`, `ErrNoLease`, `ErrOffsetGone`,
-`ErrTooLarge`, `ErrThrottled`, `ErrUnavailable`, `ErrServer`,
-`ErrNoNodes`, `ErrClosed`, `ErrNoEnvelope`.
+`ErrExists`, `ErrNameTaken`, `ErrTopicChanged`, `ErrLeaseLost`,
+`ErrNoLease`, `ErrOffsetGone`, `ErrTooLarge`, `ErrBatchFull`,
+`ErrThrottled`, `ErrUnavailable`, `ErrServer`, `ErrNoNodes`,
+`ErrClosed`, `ErrNoEnvelope`.
+
+`ErrNameTaken` (a topic name that differs from an existing one only in
+letter case) and `ErrTopicChanged` (the topic changed under the request)
+also match `ErrExists`.
 
 `*narad.Error` carries the status, the server's message and the node that
 answered. `*narad.ConnError` covers requests that never got a reply.
@@ -155,6 +191,12 @@ still be committed, so retrying it can duplicate. The client retries by
 default, because a duplicate is recoverable and a lost message is not.
 When a duplicate is the worse outcome, `WithCautiousRetries()` hands the
 choice back and `Uncertain(err)` tells you when it matters.
+
+A node that refuses a produce outright (one being decommissioned, or
+whose schema validator is busy) answers 503 and stores nothing; the
+client moves to another node without waiting. Since the status alone
+cannot tell that 503 from one that may have stored the message, every
+produce 503 counts as uncertain, and `WithCautiousRetries()` stops at it.
 
 ## Logging
 
@@ -197,7 +239,15 @@ for `narad.Event`, which reports anywhere you like.
 ## Also here
 
 Topics (`CreateTopic`, `EnsureTopic`, `Topic`, `Topics`, `DeleteTopic`,
-`SetSchema`), replay (`ReadAt`), and health (`Ping`, `Health`).
+`SetSchema`), replay (`ReadAt`, `ReadFrom`, `Replay`), and health
+(`Ping`, `Health`).
+
+`WithRetention(d)` sets an age; leaving it out gives the operator's
+default, and `WithRetentionForever()` keeps records forever (a topic's
+`Retention` of zero reads the same way). While a partition's owner is
+down, `Topic` still answers, with `Partial` set and that partition's
+stats marked unavailable (`PartitionStats.Available`); `Replay` refuses
+such a topic rather than skip the partition it cannot read.
 
 `Ping` takes the node to probe, because a probe sent through the client's
 own load balancing would answer for whichever node came next. It does not
@@ -219,12 +269,14 @@ holds exactly the bytes it was produced with: the broker sends a key that
 is not valid UTF-8 as base64 with a flag, and the client decodes it.
 `Key` is a string because `WithKey` takes one, so use `[]byte(msg.Key)`
 when the bytes matter. A message produced without a key has an empty
-`Key`.
+`Key`; from Narad 3.1.0 on the broker no longer invents one for it.
 
 ## Compatibility
 
 Go 1.23 or later. Narad's `/v1` HTTP surface is stable, so a client built
-against it keeps working across broker upgrades.
+against it keeps working across broker upgrades. Batches, keep-forever
+retention and partial topic answers need Narad 3.1.0; everything else
+works against earlier releases too.
 
 ## License
 

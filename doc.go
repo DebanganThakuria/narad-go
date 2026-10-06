@@ -46,6 +46,20 @@ across them and routes around the ones that are failing:
 	client, err := narad.New("n1:7942,n2:7942,n3:7942",
 		narad.WithAuth("svc", os.Getenv("NARAD_PASSWORD")))
 
+# Batches
+
+[Client.ProduceBatch] stores up to [MaxBatch] messages in one request,
+all or none, and [WithBatch] has a consumer take and ack them in
+batches without changing its handler. Both need Narad 3.1.0.
+
+	var batch narad.Batch
+	for _, order := range orders {
+		if err := batch.Add(order); err != nil {
+			return err
+		}
+	}
+	_, err = client.ProduceBatch(ctx, "orders", &batch)
+
 # At-least-once, and what it asks of you
 
 Handlers must be idempotent. Narad delivers at least once and does not
@@ -56,7 +70,8 @@ later.
 The same property shapes producing. When a produce fails, [Uncertain]
 reports whether the broker may have applied it anyway. Those are retried
 by default, because a duplicate is recoverable and a lost message is
-not, and [WithCautiousRetries] hands that choice back to you.
+not, and [WithCautiousRetries] hands that choice back to you. A batch
+is the same, for the whole batch.
 
 # Errors
 

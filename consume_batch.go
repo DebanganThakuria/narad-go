@@ -56,6 +56,10 @@ func WithBatch(n int) ConsumeOption {
 
 // pollBatch asks once for up to cfg.batch messages. It returns none when
 // the wait elapsed with nothing available.
+//
+// A record in the reply that cannot be decoded is reported to
+// [WithErrorHandler] and left to wait out its visibility timeout, as it
+// would be from a single consume; the rest of the batch is returned.
 func (c *Client) pollBatch(ctx context.Context, topic string, cfg consumeConfig) ([]*Message, error) {
 	if topic == "" {
 		return nil, fmt.Errorf("narad: consume: %w: topic is required", ErrBadRequest)
@@ -70,32 +74,79 @@ func (c *Client) pollBatch(ctx context.Context, topic string, cfg consumeConfig)
 	if res.status == http.StatusNoContent {
 		return nil, nil
 	}
-	return c.decodeMessages(res.body, topic)
+	msgs, bad, err := c.decodeMessages(res.body, topic)
+	for _, u := range bad {
+		c.report(cfg, u.msg, u.err)
+		c.logger().Warn("narad: could not decode a message, it will wait out its visibility timeout",
+			"topic", u.msg.Topic, "partition", u.msg.Partition, "offset", u.msg.Offset, "err", u.err)
+	}
+	return msgs, err
+}
+
+// undecodable is a record of a batch consume reply that could not be
+// decoded.
+type undecodable struct {
+	// msg holds what could be read of it: where it is and its receipt.
+	msg *Message
+	err error
 }
 
 // decodeMessages reads a batch consume reply, {"messages":[...]}.
 //
+// Each record is decoded on its own, so one this client cannot read
+// costs only that record and not the up to [MaxBatch] others reserved
+// with it. Those it cannot read come back separately.
+//
 // A node older than 3.1.0 ignores max and answers one message in the
 // single shape, so that is read too.
-func (c *Client) decodeMessages(body []byte, topic string) ([]*Message, error) {
+func (c *Client) decodeMessages(body []byte, topic string) ([]*Message, []undecodable, error) {
 	var batch struct {
-		Messages *[]*Message `json:"messages"`
+		Messages *[]json.RawMessage `json:"messages"`
 	}
 	if err := json.Unmarshal(body, &batch); err != nil {
-		return nil, fmt.Errorf("narad: consume %s: decode reply: %w", topic, err)
+		return nil, nil, fmt.Errorf("narad: consume %s: decode reply: %w", topic, err)
 	}
 	if batch.Messages == nil {
 		msg, err := c.decodeMessage(body, topic)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return []*Message{msg}, nil
+		return []*Message{msg}, nil, nil
 	}
-	msgs := *batch.Messages
-	for _, msg := range msgs {
-		msg.client = c
+	msgs := make([]*Message, 0, len(*batch.Messages))
+	var bad []undecodable
+	for _, raw := range *batch.Messages {
+		msg := &Message{client: c}
+		if err := json.Unmarshal(raw, msg); err != nil {
+			bad = append(bad, c.partlyDecoded(raw, topic, err))
+			continue
+		}
+		msgs = append(msgs, msg)
 	}
-	return msgs, nil
+	return msgs, bad, nil
+}
+
+// partlyDecoded reads what it can of a record that failed to decode: the
+// fields that say where it is decode whatever the rest of it holds.
+func (c *Client) partlyDecoded(raw json.RawMessage, topic string, cause error) undecodable {
+	var where struct {
+		Topic     string `json:"topic"`
+		Partition int    `json:"partition"`
+		Offset    int64  `json:"offset"`
+		Receipt   string `json:"receipt_handle"`
+	}
+	_ = json.Unmarshal(raw, &where)
+	if where.Topic == "" {
+		where.Topic = topic
+	}
+	msg := &Message{
+		Topic: where.Topic, Partition: where.Partition, Offset: where.Offset,
+		Receipt: where.Receipt, client: c,
+	}
+	return undecodable{
+		msg: msg,
+		err: fmt.Errorf("narad: consume %s: decode %s: %w", topic, msg.describe(), cause),
+	}
 }
 
 // dispatchBatch runs the handler over a batch of messages, one at a

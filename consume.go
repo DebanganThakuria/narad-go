@@ -116,6 +116,11 @@ func WithoutRequeue() ConsumeOption {
 // WithErrorHandler is called when a handler returns an error, when a
 // lease is lost mid-handler, or when an ack fails after the work
 // succeeded. The message is nil when the failure was not about one.
+//
+// With [WithBatch] it is also called for a message the batch brought
+// that this client could not decode. That message carries only its
+// position and receipt, no payload, and is left to wait out its
+// visibility timeout.
 func WithErrorHandler(fn func(msg *Message, err error)) ConsumeOption {
 	return func(c *consumeConfig) { c.onError = fn }
 }

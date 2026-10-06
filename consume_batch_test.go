@@ -848,3 +848,74 @@ func TestBatchAcksFinishedMessagesWhenShutdownBegins(t *testing.T) {
 		}
 	})
 }
+
+// One record this client cannot decode costs only that record. The rest
+// of its batch is handled and acked; the bad one is reported and left
+// to wait out its visibility timeout, as it would be from a single
+// consume.
+func TestAnUndecodableRecordDoesNotSinkItsBatch(t *testing.T) {
+	t.Parallel()
+
+	b := &batchConsumeBroker{}
+	inner := b.handler()
+	var served sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		first := false
+		if strings.HasSuffix(r.URL.Path, "/consume") {
+			served.Do(func() { first = true })
+		}
+		if !first {
+			inner(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"messages":[`+
+			`{"topic":"orders","partition":1,"offset":1,"receipt_handle":"1:1:9","payload":{"id":"o1"}},`+
+			`{"topic":"orders","partition":1,"offset":2,"receipt_handle":"1:2:9","key":"a2V5","key_encoding":"zstd","payload":{"id":"o2"}},`+
+			`{"topic":"orders","partition":1,"offset":3,"receipt_handle":"1:3:9","payload":{"id":"o3"}}]}`)
+	}))
+	t.Cleanup(server.Close)
+	c, err := New(server.URL, WithRetries(3),
+		WithBackoff(time.Millisecond, time.Millisecond), WithoutBreaker())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	var mu sync.Mutex
+	var handled []int64
+	var log errorLog
+	consumeInBackground(t, c, func(_ context.Context, msg *Message) error {
+		mu.Lock()
+		defer mu.Unlock()
+		handled = append(handled, msg.Offset)
+		return nil
+	}, WithBatch(3), WithErrorHandler(log.handler))
+
+	waitFor(t, func() bool {
+		var acks int
+		b.snapshot(func(b *batchConsumeBroker) { acks = len(b.acked) })
+		return acks == 2
+	}, "the two good records to be acked")
+	mu.Lock()
+	if len(handled) != 2 || handled[0] != 1 || handled[1] != 3 {
+		t.Errorf("handled %v, want [1 3]", handled)
+	}
+	mu.Unlock()
+	b.snapshot(func(b *batchConsumeBroker) {
+		if !b.acked["1:1:9"] || !b.acked["1:3:9"] {
+			t.Errorf("acked %v, want both good records", b.acked)
+		}
+		if b.acked["1:2:9"] {
+			t.Error("the undecodable record was acked")
+		}
+	})
+	errs := log.of("1:2:9")
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "zstd") {
+		t.Errorf("reported %v for the undecodable record, want its decode error", errs)
+	}
+	if errs := log.of(""); len(errs) != 0 {
+		t.Errorf("reported %v as a failed poll, want nothing", errs)
+	}
+}
+

@@ -14,7 +14,8 @@ import (
 type Topic struct {
 	Name       string
 	Partitions int
-	// Retention is how long records are kept.
+	// Retention is how long records are kept. Zero means they are kept
+	// forever.
 	Retention time.Duration
 	// VisibilityTimeout is how long a consumer holds a message before it
 	// is redelivered.
@@ -39,6 +40,11 @@ type Topic struct {
 	Created time.Time
 	// Partitions detail, one per partition.
 	PartitionStats []PartitionStats
+	// Partial is true when some partitions could not report, because
+	// their owner is down, unreachable or not assigned yet. Those
+	// entries in PartitionStats are zero placeholders; see
+	// [PartitionStats.Available].
+	Partial bool
 }
 
 // PartitionStats is one partition's storage state.
@@ -55,6 +61,21 @@ type PartitionStats struct {
 	Committed int64 `json:"high_watermark"`
 	// Owner is the node whose disk holds this partition.
 	Owner string `json:"owner_node"`
+	// Status is "ok" when the numbers are the owner's, and
+	// "owner_unavailable" when the owner could not report them and they
+	// are zero placeholders. A broker older than 3.1.0 leaves it empty,
+	// and its numbers are always real.
+	Status string `json:"status,omitempty"`
+	// OwnerLiveness says why an unavailable partition's owner could not
+	// report: "dead", "unreachable", "unknown" or "unassigned". It is
+	// empty for a partition whose numbers are real.
+	OwnerLiveness string `json:"owner_liveness,omitempty"`
+}
+
+// Available reports whether the partition's numbers are real. A total
+// over a topic must leave out the ones that are not.
+func (p PartitionStats) Available() bool {
+	return p.Status == "" || p.Status == "ok"
 }
 
 // Depth is how many records the partition still holds: the committed
@@ -76,6 +97,7 @@ type TopicOption func(*topicConfig)
 type topicConfig struct {
 	partitions int
 	retention  time.Duration
+	forever    bool
 	visibility time.Duration
 	inFlight   int64
 	ackedAhead int64
@@ -93,9 +115,31 @@ func WithPartitionCount(n int) TopicOption {
 }
 
 // WithRetention sets how long records are kept. The broker enforces a
-// floor of one hour.
+// floor of one hour. Without it, or with zero, the topic gets the
+// operator's default.
 func WithRetention(d time.Duration) TopicOption {
-	return func(c *topicConfig) { c.retention = d }
+	return func(c *topicConfig) { c.retention, c.forever = d, false }
+}
+
+// WithRetentionForever keeps the topic's records forever, whatever the
+// operator's default is. It needs a 3.1.0 broker; an older one reads it
+// as asking for the default.
+func WithRetentionForever() TopicOption {
+	return func(c *topicConfig) { c.retention, c.forever = 0, true }
+}
+
+// retentionMs is the retention_ms a create sends: nil to leave it out,
+// which gives the operator's default, and 0 for keep forever.
+func (c topicConfig) retentionMs() *int64 {
+	switch {
+	case c.forever:
+		forever := int64(0)
+		return &forever
+	case c.retention != 0:
+		ms := c.retention.Milliseconds()
+		return &ms
+	}
+	return nil
 }
 
 // WithVisibilityTimeout sets how long a consumer holds a message before
@@ -184,6 +228,7 @@ type topicJSON struct {
 	Schema              json.RawMessage  `json:"schema,omitempty"`
 	SchemaVersion       int              `json:"schema_version,omitempty"`
 	PartitionStats      []PartitionStats `json:"partition_stats,omitempty"`
+	Partial             bool             `json:"partial,omitempty"`
 }
 
 func (t topicJSON) toTopic() Topic {
@@ -199,6 +244,7 @@ func (t topicJSON) toTopic() Topic {
 		Schema:            t.Schema,
 		SchemaVersion:     t.SchemaVersion,
 		PartitionStats:    t.PartitionStats,
+		Partial:           t.Partial,
 	}
 	if t.CreatedAt != 0 {
 		out.Created = time.UnixMilli(t.CreatedAt)
@@ -214,6 +260,11 @@ func (t topicJSON) toTopic() Topic {
 //
 // Creating one that already exists reports [ErrExists]. When that is not
 // an error for you, which it usually is not, use [Client.EnsureTopic].
+//
+// A new name may be up to 200 bytes; a longer one is [ErrBadRequest].
+// One that differs from an existing topic's only in letter case is
+// [ErrNameTaken], since on a case-insensitive filesystem the two would
+// share a directory.
 func (c *Client) CreateTopic(ctx context.Context, name string, opts ...TopicOption) (Topic, error) {
 	var out Topic
 	if name == "" {
@@ -230,7 +281,7 @@ func (c *Client) CreateTopic(ctx context.Context, name string, opts ...TopicOpti
 	body, err := json.Marshal(struct {
 		Name                string          `json:"name"`
 		Partitions          int             `json:"partitions,omitempty"`
-		RetentionMs         int64           `json:"retention_ms,omitempty"`
+		RetentionMs         *int64          `json:"retention_ms,omitempty"`
 		VisibilityTimeoutMs int64           `json:"visibility_timeout_ms,omitempty"`
 		MaxInFlight         int64           `json:"max_in_flight_per_partition,omitempty"`
 		MaxAckedAhead       int64           `json:"max_acked_ahead_per_partition,omitempty"`
@@ -240,7 +291,7 @@ func (c *Client) CreateTopic(ctx context.Context, name string, opts ...TopicOpti
 	}{
 		Name:                name,
 		Partitions:          cfg.partitions,
-		RetentionMs:         cfg.retention.Milliseconds(),
+		RetentionMs:         cfg.retentionMs(),
 		VisibilityTimeoutMs: cfg.visibility.Milliseconds(),
 		MaxInFlight:         cfg.inFlight,
 		MaxAckedAhead:       cfg.ackedAhead,
@@ -276,12 +327,15 @@ func (c *Client) CreateTopic(ctx context.Context, name string, opts ...TopicOpti
 //
 // This is what a service starting up wants: every replica of it races
 // every other to create the same topics, and only one can win.
+//
+// A topic whose name differs only in letter case is not the one asked
+// for, so that is reported as [ErrNameTaken] rather than success.
 func (c *Client) EnsureTopic(ctx context.Context, name string, opts ...TopicOption) (Topic, error) {
 	created, err := c.CreateTopic(ctx, name, opts...)
 	if err == nil {
 		return created, nil
 	}
-	if !errorIs(err, ErrExists) {
+	if !errorIs(err, ErrExists) || errorIs(err, ErrNameTaken) {
 		return created, err
 	}
 	existing, lookupErr := c.Topic(ctx, name)
@@ -292,6 +346,10 @@ func (c *Client) EnsureTopic(ctx context.Context, name string, opts ...TopicOpti
 }
 
 // Topic describes one topic, including its per-partition state.
+//
+// While a partition's owner is down the answer is still a topic, with
+// Partial set and that partition's stats left as placeholders; see
+// [PartitionStats.Available].
 func (c *Client) Topic(ctx context.Context, name string) (Topic, error) {
 	var out Topic
 	if name == "" {
@@ -357,7 +415,9 @@ func (c *Client) Topics(ctx context.Context) ([]Topic, error) {
 // undone.
 //
 // A topic that is already gone counts as deleted: the usual way to see
-// that is a retry whose first attempt actually worked.
+// that is a retry whose first attempt actually worked. A topic deleted
+// and recreated under the same name while the delete was being applied
+// reports [ErrTopicChanged]; look at it again before deciding.
 func (c *Client) DeleteTopic(ctx context.Context, name string) error {
 	if name == "" {
 		return fmt.Errorf("narad: delete topic: %w: name is required", ErrBadRequest)
@@ -377,7 +437,8 @@ func (c *Client) DeleteTopic(ctx context.Context, name string) error {
 // Versions are append-only and checked for compatibility, so a consumer
 // written against an older one keeps working. Use [WithSchema] or
 // [WithEnvelopeSchema] to supply it, and [WithSchemaBaseVersion] to make
-// the change conditional on the version you read.
+// the change conditional on the version you read. A topic that changed
+// under the request reports [ErrTopicChanged]: read it again and retry.
 //
 //	topic, _ := client.Topic(ctx, "orders")
 //	_, err := client.SetSchema(ctx, "orders",

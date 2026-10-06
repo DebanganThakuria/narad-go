@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -523,6 +524,20 @@ func (e *goneError) Error() string {
 // errors.Is(err, ErrOffsetGone) and errors.As(err, &apiErr) both work.
 func (e *goneError) Unwrap() []error { return []error{ErrOffsetGone, e.cause} }
 
+// unavailablePartitions reports the partitions of a partial topic.
+func unavailablePartitions(info Topic) error {
+	var down []string
+	for _, stats := range info.PartitionStats {
+		if !stats.Available() {
+			down = append(down, fmt.Sprintf("%d (owner %s)", stats.Index, stats.OwnerLiveness))
+		}
+	}
+	if len(down) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: partition %s cannot be read now", ErrUnavailable, strings.Join(down, ", "))
+}
+
 // errorIs is errors.Is, named here so the hot paths read cleanly.
 func errorIs(err, target error) bool { return errors.Is(err, target) }
 
@@ -586,6 +601,10 @@ func (c *Client) ReadFrom(ctx context.Context, topic string, partition int, offs
 // There is no ordering across partitions. Within one, records come in
 // offset order.
 //
+// While a partition's owner is down it reads nothing and reports
+// [ErrUnavailable], naming the partitions, since that partition's
+// history cannot be read.
+//
 //	err := client.Replay(ctx, "orders", narad.HandlerFunc(
 //		func(ctx context.Context, msg *narad.Message) error {
 //			fmt.Println(msg.Partition, msg.Offset, msg.ID())
@@ -597,6 +616,12 @@ func (c *Client) Replay(ctx context.Context, topic string, h Handler) error {
 	}
 	info, err := c.Topic(ctx, topic)
 	if err != nil {
+		return fmt.Errorf("narad: replay %s: %w", topic, err)
+	}
+	// A partition whose owner is down reports placeholder offsets, and
+	// replaying it from those would start at zero and read nothing. Say
+	// so before reading anything, rather than return half a replay.
+	if err := unavailablePartitions(info); err != nil {
 		return fmt.Errorf("narad: replay %s: %w", topic, err)
 	}
 	// The partition stats say where each log starts, so a replay begins

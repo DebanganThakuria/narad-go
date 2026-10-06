@@ -262,3 +262,137 @@ func TestTopicCallsRejectEmptyNames(t *testing.T) {
 }
 
 func errFrom(fn func() error) error { return fn() }
+
+// retention_ms 0 means keep forever from 3.1.0 on, and leaving the field
+// out gives the operator's default. The two must not be confused, in
+// either direction.
+func TestRetentionDefaultAndForeverAreSentApart(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		opts    []TopicOption
+		present bool
+		want    float64
+	}{
+		{"unset gives the default", nil, false, 0},
+		{"zero gives the default, as it always did", []TopicOption{WithRetention(0)}, false, 0},
+		{"forever is an explicit zero", []TopicOption{WithRetentionForever()}, true, 0},
+		{"an age is sent in milliseconds", []TopicOption{WithRetention(2 * time.Hour)}, true, 7_200_000},
+		{"the last option wins", []TopicOption{WithRetentionForever(), WithRetention(time.Hour)}, true, 3_600_000},
+		{"forever wins when it comes last", []TopicOption{WithRetention(time.Hour), WithRetentionForever()}, true, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var sent []byte
+			c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				sent, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"name":"orders","partitions":3}`))
+			})
+			if _, err := c.CreateTopic(context.Background(), "orders", tc.opts...); err != nil {
+				t.Fatalf("CreateTopic: %v", err)
+			}
+			var body map[string]any
+			if err := json.Unmarshal(sent, &body); err != nil {
+				t.Fatalf("request body: %v", err)
+			}
+			got, present := body["retention_ms"]
+			if present != tc.present {
+				t.Fatalf("retention_ms present = %v, want %v (body %s)", present, tc.present, sent)
+			}
+			if present && got != tc.want {
+				t.Errorf("retention_ms = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The broker answers a describe with a 200 while a partition owner is
+// down (handlers/topics/get.go): the partitions it could read carry
+// status "ok", the others zero placeholders with the owner's liveness.
+const partialTopicFixture = `{
+	"name": "orders",
+	"partitions": 3,
+	"retention_ms": 0,
+	"visibility_timeout_ms": 30000,
+	"partition_stats": [
+		{"index":0,"segments":1,"oldest_offset":0,"next_offset":12,"high_watermark":12,"size_bytes":900,"owner_node":"narad-1","status":"ok"},
+		{"index":1,"segments":0,"oldest_offset":0,"next_offset":0,"high_watermark":0,"size_bytes":0,"owner_node":"narad-2","status":"owner_unavailable","owner_liveness":"dead"},
+		{"index":2,"segments":1,"oldest_offset":4,"next_offset":9,"high_watermark":9,"size_bytes":300,"owner_node":"narad-3","status":"ok"}
+	],
+	"partial": true
+}`
+
+func TestPartialTopicSaysWhichPartitionsAreReal(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(partialTopicFixture))
+	})
+
+	topic, err := c.Topic(context.Background(), "orders")
+	if err != nil {
+		t.Fatalf("Topic: %v", err)
+	}
+	if !topic.Partial {
+		t.Error("Partial did not decode")
+	}
+	if topic.Retention != 0 {
+		t.Errorf("retention = %s, want 0, which means kept forever", topic.Retention)
+	}
+	if len(topic.PartitionStats) != 3 {
+		t.Fatalf("partition stats = %+v", topic.PartitionStats)
+	}
+	down := topic.PartitionStats[1]
+	if down.Available() || down.Status != "owner_unavailable" || down.OwnerLiveness != "dead" {
+		t.Errorf("unavailable partition decoded as %+v", down)
+	}
+	for _, i := range []int{0, 2} {
+		if !topic.PartitionStats[i].Available() {
+			t.Errorf("partition %d should be available: %+v", i, topic.PartitionStats[i])
+		}
+	}
+	// A broker before 3.1.0 sends no status, and its numbers are real.
+	if !(PartitionStats{}).Available() {
+		t.Error("a partition with no status should count as available")
+	}
+}
+
+func TestEnsureTopicDoesNotAcceptANameInAnotherLetterCase(t *testing.T) {
+	t.Parallel()
+
+	var lookups atomic.Int32
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			writeBrokerError(w, http.StatusConflict,
+				`topic already exists: "Orders" differs only in letter case from the existing topic "orders"; on a case-insensitive filesystem both would share one directory, so choose another name`)
+			return
+		}
+		lookups.Add(1)
+		writeBrokerError(w, http.StatusNotFound, "topic not found")
+	})
+
+	_, err := c.EnsureTopic(context.Background(), "Orders")
+	if !errors.Is(err, ErrNameTaken) {
+		t.Fatalf("err = %v, want ErrNameTaken", err)
+	}
+	if lookups.Load() != 0 {
+		t.Error("EnsureTopic looked up a topic it already knows is not there")
+	}
+}
+
+func TestTopicChangedUnderASchemaChangeIsReported(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		writeBrokerError(w, http.StatusConflict, "topic changed since it was read")
+	})
+	_, err := c.SetSchema(context.Background(), "orders", WithSchema(json.RawMessage(`{"type":"object"}`)))
+	if !errors.Is(err, ErrTopicChanged) || Retryable(err) {
+		t.Fatalf("err = %v, want a non-retryable ErrTopicChanged", err)
+	}
+}

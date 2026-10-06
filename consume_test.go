@@ -1042,3 +1042,33 @@ func TestReplayStopsOnContextCancellation(t *testing.T) {
 		t.Errorf("handled %d records after cancellation", count)
 	}
 }
+
+// A partition whose owner is down reports zero placeholders. Replaying
+// it from them would read nothing and look like an empty partition, so
+// the replay refuses before reading anything.
+func TestReplayRefusesATopicWithAnUnavailablePartition(t *testing.T) {
+	t.Parallel()
+
+	var reads atomic.Int32
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/consume") {
+			reads.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(partialTopicFixture))
+	})
+
+	err := c.Replay(context.Background(), "orders", HandlerFunc(
+		func(context.Context, *Message) error { return nil }))
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), "partition 1 (owner dead)") {
+		t.Errorf("err = %v, want it to name the partition and why", err)
+	}
+	if reads.Load() != 0 {
+		t.Errorf("replay read %d records before refusing", reads.Load())
+	}
+}

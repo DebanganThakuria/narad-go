@@ -117,6 +117,10 @@ func WithoutRequeue() ConsumeOption {
 // lease is lost mid-handler, or when an ack fails after the work
 // succeeded. The message is nil when the failure was not about one.
 //
+// With one worker it is never called twice at once. With [WithWorkers]
+// above one, the workers call it concurrently, so it must be safe for
+// that.
+//
 // With [WithBatch] it is also called for a message the batch brought
 // that this client could not decode. That message carries only its
 // position and receipt, no payload, and is left to wait out its

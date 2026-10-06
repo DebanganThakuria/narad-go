@@ -158,8 +158,17 @@ func (c *Client) dispatchBatch(pollCtx, workCtx context.Context, h Handler, msgs
 	leases := c.holdLeases(workCtx, msgs, cfg.visibility)
 	defer leases.stop()
 
+	// Shutdown reports from its own goroutine while the loop may still
+	// be reporting, and a single worker's error handler must not be
+	// called twice at once, so every report of the batch takes turns.
+	var reportMu sync.Mutex
+	report := func(msg *Message, err error) {
+		reportMu.Lock()
+		defer reportMu.Unlock()
+		c.report(cfg, msg, err)
+	}
 	reportLost := func(msg *Message, when string) {
-		c.report(cfg, msg, fmt.Errorf("narad: %s: %w %s", msg.describe(), ErrLeaseLost, when))
+		report(msg, fmt.Errorf("narad: %s: %w %s", msg.describe(), ErrLeaseLost, when))
 		c.logger().Warn("narad: lease lost "+when,
 			"topic", msg.Topic, "id", msg.ID(), "offset", msg.Offset)
 	}
@@ -197,7 +206,7 @@ func (c *Client) dispatchBatch(pollCtx, workCtx context.Context, h Handler, msgs
 				continue
 			}
 			msg := toAck[i]
-			c.report(cfg, msg, fmt.Errorf("narad: %s: the handler succeeded but the ack failed, so the message will be redelivered: %w",
+			report(msg, fmt.Errorf("narad: %s: the handler succeeded but the ack failed, so the message will be redelivered: %w",
 				msg.describe(), err))
 			c.logger().Error("narad: ack failed after successful handling",
 				"topic", msg.Topic, "id", msg.ID(), "offset", msg.Offset, "err", err)
@@ -282,7 +291,7 @@ func (c *Client) dispatchBatch(pollCtx, workCtx context.Context, h Handler, msgs
 		if err == nil {
 			continue
 		}
-		c.report(cfg, msg, err)
+		report(msg, err)
 		c.logger().Warn("narad: handler failed",
 			"topic", msg.Topic, "id", msg.ID(), "offset", msg.Offset,
 			"requeued", cfg.requeue && !settled, "err", err)

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -973,6 +974,58 @@ func TestBatchHandsBackUnstartedMessagesWhileTheHandlerStillRuns(t *testing.T) {
 	defer mu.Unlock()
 	if len(handled) != 1 {
 		t.Errorf("handled %v, want only the message already in hand", handled)
+	}
+}
+
+// With one worker, the error handler is never called twice at once,
+// batch or not: an ack failure reported as shutdown begins waits for a
+// handler failure being reported, and the other way round.
+func TestBatchReportsErrorsOneAtATime(t *testing.T) {
+	t.Parallel()
+
+	b := &batchConsumeBroker{statuses: map[string][]int{"1:1:9": {http.StatusGone}}}
+	b.queue(msgAt(1, "1:1:9"), msgAt(2, "1:2:9"))
+	c := newBatchConsumeClient(t, b)
+
+	var inside, overlapped atomic.Bool
+	firstReport := make(chan struct{})
+	var firstOnce sync.Once
+	onError := func(*Message, error) {
+		if !inside.CompareAndSwap(false, true) {
+			overlapped.Store(true)
+			return
+		}
+		defer inside.Store(false)
+		firstOnce.Do(func() { close(firstReport) })
+		// Linger, so a report made meanwhile from another goroutine is
+		// caught overlapping this one.
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	handling := make(chan struct{})
+	fail := make(chan struct{})
+	stop := consumeInBackground(t, c, func(_ context.Context, msg *Message) error {
+		if msg.Offset == 2 {
+			close(handling)
+			<-fail
+			return errors.New("handler failed")
+		}
+		return nil
+	}, WithBatch(2), WithErrorHandler(onError))
+
+	<-handling
+	// Shutdown acks message 1 at once; the broker answers 410, which is
+	// reported while message 2's handler is still running.
+	go stop()
+	select {
+	case <-firstReport:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the failed ack was not reported")
+	}
+	close(fail)
+	stop()
+	if overlapped.Load() {
+		t.Error("the error handler was called again while a call was still running")
 	}
 }
 

@@ -39,9 +39,10 @@ const (
 // lease, and in a batch a message also waits for the ones ahead of it
 // and for the batch ack.
 //
-// On shutdown, the messages already handled are acked at once, so a
-// handler abandoned at the end of [WithShutdownGrace] costs only its own
-// message, and the messages not yet started are handed back.
+// On shutdown, the messages already handled are acked at once and the
+// messages not yet started are handed back at once, while the message
+// in hand is still running, so a handler abandoned at the end of
+// [WithShutdownGrace] costs only its own message.
 //
 // The trade: a message's ack goes out when its whole batch is done, not
 // when it is, so a crash mid-batch redelivers messages already handled.
@@ -165,8 +166,13 @@ func (c *Client) dispatchBatch(pollCtx, workCtx context.Context, h Handler, msgs
 
 	// succeeded holds the messages handled successfully and not yet
 	// acked. Shutdown acks them from another goroutine.
+	//
+	// next is the index of the first message the loop has not started,
+	// and handedBack records that the messages from next on have been
+	// handed back, after which the loop starts no more.
 	var mu sync.Mutex
 	var succeeded []int
+	next, handedBack := 0, false
 	flush := func() {
 		mu.Lock()
 		held := succeeded
@@ -197,22 +203,55 @@ func (c *Client) dispatchBatch(pollCtx, workCtx context.Context, h Handler, msgs
 				"topic", msg.Topic, "id", msg.ID(), "offset", msg.Offset, "err", err)
 		}
 	}
+	// handBackUnstarted hands back, at once and in one request, every
+	// message the loop has not started, rather than leave them to wait
+	// out their visibility timeout. It runs once.
+	handBackUnstarted := func() {
+		mu.Lock()
+		from := next
+		if handedBack {
+			from = len(msgs)
+		}
+		handedBack = true
+		mu.Unlock()
+
+		var toHandBack []*Message
+		for i := from; i < len(msgs); i++ {
+			if !leases.release(i) {
+				toHandBack = append(toHandBack, msgs[i])
+			}
+		}
+		settleCtx, cancel := settleContext(workCtx)
+		defer cancel()
+		for i, err := range c.settleMany(settleCtx, opNack, toHandBack) {
+			if err != nil {
+				c.logger().Warn("narad: could not hand an unstarted message back, it will wait out its visibility timeout",
+					"topic", toHandBack[i].Topic, "id", toHandBack[i].ID(), "err", err)
+			}
+		}
+	}
 	// Once shutdown begins, the message in hand may outlast the grace
-	// period and be abandoned, and the messages already handled must not
-	// go down with it, so they are acked at once.
+	// period and be abandoned, and neither the messages already handled
+	// nor the ones not yet started must go down with it: the first are
+	// acked at once, the rest handed back at once.
 	flushed := make(chan struct{})
 	stopFlush := context.AfterFunc(pollCtx, func() {
 		defer close(flushed)
 		flush()
+		handBackUnstarted()
 	})
 
-	var unstarted []int
 	for i, msg := range msgs {
-		if pollCtx.Err() != nil {
-			// Shutting down: whatever has not started goes back now
-			// rather than when its lease lapses.
-			unstarted = append(unstarted, i)
-			continue
+		mu.Lock()
+		// Shutting down: whatever has not started goes back now rather
+		// than when its lease lapses.
+		stopping := handedBack || pollCtx.Err() != nil
+		if !stopping {
+			next = i + 1
+		}
+		mu.Unlock()
+		if stopping {
+			break
 		}
 		if leases.lost(i) {
 			leases.release(i)
@@ -258,21 +297,7 @@ func (c *Client) dispatchBatch(pollCtx, workCtx context.Context, h Handler, msgs
 		<-flushed
 	}
 	flush()
-
-	var toHandBack []*Message
-	for _, i := range unstarted {
-		if !leases.release(i) {
-			toHandBack = append(toHandBack, msgs[i])
-		}
-	}
-	settleCtx, cancel := settleContext(workCtx)
-	defer cancel()
-	for i, err := range c.settleMany(settleCtx, opNack, toHandBack) {
-		if err != nil {
-			c.logger().Warn("narad: could not hand an unstarted message back, it will wait out its visibility timeout",
-				"topic", toHandBack[i].Topic, "id", toHandBack[i].ID(), "err", err)
-		}
-	}
+	handBackUnstarted()
 }
 
 // batchLeases keeps the leases of a batch alive, with one extend request

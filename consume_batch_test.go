@@ -919,3 +919,60 @@ func TestAnUndecodableRecordDoesNotSinkItsBatch(t *testing.T) {
 	}
 }
 
+// Shutdown hands the unstarted messages of a batch back at once, even
+// while the message in hand is still running, rather than holding them
+// for the grace period and, if that handler is abandoned, for a whole
+// visibility timeout after it.
+func TestBatchHandsBackUnstartedMessagesWhileTheHandlerStillRuns(t *testing.T) {
+	t.Parallel()
+
+	b := &batchConsumeBroker{}
+	b.queue(msgAt(1, "1:1:9"), msgAt(2, "1:2:9"), msgAt(3, "1:3:9"), msgAt(4, "1:4:9"))
+	c := newBatchConsumeClient(t, b)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var handled []int64
+	stop := consumeInBackground(t, c, func(_ context.Context, msg *Message) error {
+		mu.Lock()
+		handled = append(handled, msg.Offset)
+		mu.Unlock()
+		if msg.Offset == 1 {
+			close(started)
+			<-release // deliberately ignores cancellation
+		}
+		return nil
+	}, WithBatch(4), WithShutdownGrace(3*time.Second))
+	var once sync.Once
+	letGo := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(letGo)
+
+	<-started
+	go stop()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var nacks [][]string
+	for time.Now().Before(deadline) {
+		b.snapshot(func(b *batchConsumeBroker) { nacks = append([][]string(nil), b.batchNacks...) })
+		if len(nacks) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(nacks) != 1 || len(nacks[0]) != 3 {
+		t.Errorf("batch nacks while the handler ran = %v, want the three unstarted messages in one", nacks)
+	}
+
+	letGo()
+	waitFor(t, func() bool {
+		var acked bool
+		b.snapshot(func(b *batchConsumeBroker) { acked = b.acked["1:1:9"] })
+		return acked
+	}, "the message in hand to be acked once it finished")
+	mu.Lock()
+	defer mu.Unlock()
+	if len(handled) != 1 {
+		t.Errorf("handled %v, want only the message already in hand", handled)
+	}
+}
+

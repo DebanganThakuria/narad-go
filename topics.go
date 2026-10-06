@@ -116,7 +116,9 @@ func WithPartitionCount(n int) TopicOption {
 
 // WithRetention sets how long records are kept. The broker enforces a
 // floor of one hour. Without it, or with zero, the topic gets the
-// operator's default.
+// operator's default. Anything under a millisecond is refused with
+// [ErrBadRequest], since it is almost always a bare number meant as
+// another unit: WithRetention(24) is 24 nanoseconds.
 func WithRetention(d time.Duration) TopicOption {
 	return func(c *topicConfig) { c.retention, c.forever = d, false }
 }
@@ -126,6 +128,16 @@ func WithRetention(d time.Duration) TopicOption {
 // as asking for the default.
 func WithRetentionForever() TopicOption {
 	return func(c *topicConfig) { c.retention, c.forever = 0, true }
+}
+
+// retentionError refuses a retention that is not zero but rounds to
+// zero milliseconds, because retention_ms 0 is keep forever.
+func (c topicConfig) retentionError() error {
+	if c.retention != 0 && c.retention.Milliseconds() == 0 {
+		return fmt.Errorf("%w: retention %s is under a millisecond; pass a duration such as 24*time.Hour",
+			ErrBadRequest, c.retention)
+	}
+	return nil
 }
 
 // retentionMs is the retention_ms a create sends: nil to leave it out,
@@ -275,6 +287,9 @@ func (c *Client) CreateTopic(ctx context.Context, name string, opts ...TopicOpti
 		opt(&cfg)
 	}
 	if err := cfg.schemaError(); err != nil {
+		return out, fmt.Errorf("narad: create topic %s: %w", name, err)
+	}
+	if err := cfg.retentionError(); err != nil {
 		return out, fmt.Errorf("narad: create topic %s: %w", name, err)
 	}
 

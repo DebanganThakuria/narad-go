@@ -396,3 +396,30 @@ func TestTopicChangedUnderASchemaChangeIsReported(t *testing.T) {
 		t.Fatalf("err = %v, want a non-retryable ErrTopicChanged", err)
 	}
 }
+
+// A retention under a millisecond truncates to retention_ms 0, which the
+// broker reads as keep forever. WithRetention(24), meaning hours but
+// passing nanoseconds, must fail rather than keep records for good.
+func TestRetentionUnderAMillisecondIsRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, d := range []time.Duration{24, time.Nanosecond, 999 * time.Microsecond, -500 * time.Microsecond} {
+		t.Run(d.String(), func(t *testing.T) {
+			t.Parallel()
+			var sent atomic.Int32
+			c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				sent.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"name":"orders","partitions":3}`))
+			})
+			_, err := c.CreateTopic(context.Background(), "orders", WithRetention(d))
+			if !errors.Is(err, ErrBadRequest) {
+				t.Errorf("err = %v, want ErrBadRequest", err)
+			}
+			if sent.Load() != 0 {
+				t.Error("the create was sent")
+			}
+		})
+	}
+}

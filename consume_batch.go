@@ -275,6 +275,15 @@ func (c *Client) settleMany(ctx context.Context, op string, msgs []*Message) []e
 			for _, i := range pending {
 				errs[i] = err
 			}
+			if errors.Is(err, errBatchReply) {
+				// The broker answered 200, so it processed every ack in
+				// the batch; only the reply was unreadable. Send them
+				// again, as acks that may have landed.
+				for _, i := range pending {
+					mayHaveLanded[i] = true
+				}
+				continue
+			}
 			if !Retryable(err) {
 				return errs
 			}
@@ -353,8 +362,8 @@ func (c *Client) ackBatch(ctx context.Context, topic, op string, extra map[strin
 	var reply struct {
 		Results []ackResult `json:"results"`
 	}
-	if err := decode(res.body, &reply, op+" "+topic); err != nil {
-		return nil, "", err
+	if err := json.Unmarshal(res.body, &reply); err != nil {
+		return nil, "", fmt.Errorf("narad: %s %s: %w: %w", op, topic, errBatchReply, err)
 	}
 	if len(reply.Results) != len(pending) {
 		return nil, "", fmt.Errorf("narad: %s %s: %w: %d results for %d receipt handles",
@@ -363,5 +372,6 @@ func (c *Client) ackBatch(ctx context.Context, topic, op string, extra map[strin
 	return reply.Results, res.node, nil
 }
 
-// errBatchReply is a batch ack reply that does not match its request.
+// errBatchReply is a 200 batch ack reply that does not decode or does
+// not match its request.
 var errBatchReply = errors.New("reply does not match the request")

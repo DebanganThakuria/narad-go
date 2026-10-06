@@ -38,6 +38,9 @@ type batchConsumeBroker struct {
 	// failFirstBatchAck applies the first batch ack and then answers it
 	// 500, as a broker whose reply was lost.
 	failFirstBatchAck bool
+	// garbleFirstBatchAck applies the first batch ack and then answers
+	// 200 with this body, as a proxy that mangled the reply would.
+	garbleFirstBatchAck *string
 
 	maxes        []string
 	batchAcks    [][]string // the handles of each batch ack, by request
@@ -157,6 +160,11 @@ func (b *batchConsumeBroker) handler() http.HandlerFunc {
 			}
 			if b.failFirstBatchAck && len(b.batchAcks) == 1 && extend != "0" {
 				writeBrokerError(w, http.StatusInternalServerError, "ack failed")
+				return
+			}
+			if b.garbleFirstBatchAck != nil && len(b.batchAcks) == 1 && extend != "0" {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, *b.garbleFirstBatchAck)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -375,6 +383,42 @@ func TestBatchAckResolvesAGoneAfterALostReplyAsSuccess(t *testing.T) {
 		if !errors.Is(err, ErrLeaseLost) {
 			t.Errorf("message %d acked twice: %v, want ErrLeaseLost", i, err)
 		}
+	}
+}
+
+// A 200 means the broker processed the batch ack, so a reply that does
+// not decode, or does not match the request, leaves every ack possibly
+// landed. The retry's 410s then mean those acks spent the handles.
+func TestBatchAckWithAnUnreadableReplyIsRetriedAsPossiblyLanded(t *testing.T) {
+	t.Parallel()
+
+	for name, body := range map[string]string{
+		"undecodable":     `{"results":[{"status":204},`,
+		"too few results": `{"results":[{"status":204}]}`,
+		"empty":           ``,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			b := &batchConsumeBroker{garbleFirstBatchAck: &body}
+			c := newBatchConsumeClient(t, b)
+			msgs := []*Message{msgAt(0, "1:0:9"), msgAt(1, "1:1:9")}
+			for _, msg := range msgs {
+				msg.client = c
+			}
+			for i, err := range c.settleMany(context.Background(), opAck, msgs) {
+				if err != nil {
+					t.Errorf("message %d: %v, want acked", i, err)
+				}
+				if !msgs[i].isSettled() {
+					t.Errorf("message %d is not marked settled", i)
+				}
+			}
+			b.snapshot(func(b *batchConsumeBroker) {
+				if len(b.batchAcks) != 2 {
+					t.Errorf("batch acks = %v, want the first and one retry", b.batchAcks)
+				}
+			})
+		})
 	}
 }
 

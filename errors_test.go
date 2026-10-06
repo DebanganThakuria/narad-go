@@ -19,16 +19,18 @@ func writeBrokerError(w http.ResponseWriter, status int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-// The two produce 503s the broker answers with nothing stored: a node
-// being decommissioned (with Retry-After: 1) and a schema validator that
-// stayed busy for 5s.
+// The produce 503s a 3.1.0 broker answers with nothing stored: a node
+// being decommissioned (with Retry-After: 1), and a schema validation
+// that never ran because no slot freed up, either within the node's 5s
+// wait or before the request's own deadline.
 var nothingStored503s = []struct {
 	name       string
 	retryAfter string
 	message    string
 }{
 	{"draining node", "1", "this node is being decommissioned and takes no new produce; send it to another node"},
-	{"busy schema validator", "", "schema: validation capacity busy, retry"},
+	{"busy schema validator", "", "schema: validation capacity busy, retry: no schema validation slot on this node freed up within 5s, so the payload was not validated; retry, preferably through another node"},
+	{"schema validation wait cut short", "", "schema: payload not validated: context deadline exceeded while waiting for a schema validation slot"},
 }
 
 func TestProduceRefusedByOneNodeLandsOnAnotherWithoutWaiting(t *testing.T) {
@@ -78,32 +80,89 @@ func TestProduceRefusedByOneNodeLandsOnAnotherWithoutWaiting(t *testing.T) {
 	}
 }
 
-// The broker's changelog promises that WithCautiousRetries stops at a
-// produce 503, since the client reads every produce 503 as possibly
-// applied. Keep that true.
-func TestCautiousRetriesStopAtEveryProduce503(t *testing.T) {
+// A produce 503 the broker sends with nothing stored is certain, so
+// WithCautiousRetries moves on to the next node rather than stop and
+// leave the caller to reconcile a message that was never written. This
+// is what lets a cautious producer ride through a decommission.
+func TestCautiousRetriesMoveOnFromA503ThatStoredNothing(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range nothingStored503s {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			var calls atomic.Int32
-			c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-				calls.Add(1)
+			refused := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if tc.retryAfter != "" {
 					w.Header().Set("Retry-After", tc.retryAfter)
 				}
 				writeBrokerError(w, http.StatusServiceUnavailable, tc.message)
+			}))
+			defer refused.Close()
+			b := &batchBroker{}
+			healthy := httptest.NewServer(b.handler())
+			defer healthy.Close()
+
+			c, err := New(refused.URL+","+healthy.URL, WithRetries(2), WithCautiousRetries(),
+				WithBackoff(time.Millisecond, time.Millisecond), WithoutBreaker())
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			defer c.Close()
+
+			// Whichever node goes first, every batch must end on the
+			// healthy one.
+			for range 4 {
+				var batch Batch
+				_ = batch.Add(order{ID: "o1"})
+				_ = batch.Add(order{ID: "o2"})
+				if err := c.ProduceBatch(context.Background(), "orders", &batch); err != nil {
+					t.Fatalf("ProduceBatch: %v", err)
+				}
+			}
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			if len(b.stored) != 8 {
+				t.Errorf("healthy node stored %d messages, want all 8", len(b.stored))
+			}
+
+			apiErr := &Error{Op: opProduce, Status: http.StatusServiceUnavailable, Message: tc.message}
+			if Uncertain(apiErr) || !Retryable(apiErr) {
+				t.Errorf("got retryable=%v uncertain=%v, want a retryable 503 that stored nothing",
+					Retryable(apiErr), Uncertain(apiErr))
+			}
+		})
+	}
+}
+
+// Any other produce 503, such as one from a proxy that may have passed
+// the request on before it gave up, may have stored the message, and
+// cautious retries stop there.
+func TestCautiousRetriesStopAtAnUnrecognisedProduce503(t *testing.T) {
+	t.Parallel()
+
+	for _, op := range []string{opProduce, opProduceBatch} {
+		t.Run(op, func(t *testing.T) {
+			t.Parallel()
+
+			var calls atomic.Int32
+			c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				http.Error(w, "upstream connect error or disconnect/reset before headers", http.StatusServiceUnavailable)
 			}, WithRetries(4), WithCautiousRetries())
 
-			err := c.Produce(context.Background(), "orders", map[string]int{"a": 1})
+			var err error
+			if op == opProduce {
+				err = c.Produce(context.Background(), "orders", map[string]int{"a": 1})
+			} else {
+				var batch Batch
+				_ = batch.Add(order{ID: "o1"})
+				err = c.ProduceBatch(context.Background(), "orders", &batch)
+			}
 			if !errors.Is(err, ErrUnavailable) {
 				t.Fatalf("err = %v, want ErrUnavailable", err)
 			}
 			if !Uncertain(err) || !Retryable(err) {
-				t.Errorf("a produce 503 should be retryable and uncertain, got retryable=%v uncertain=%v",
-					Retryable(err), Uncertain(err))
+				t.Errorf("got retryable=%v uncertain=%v, want both", Retryable(err), Uncertain(err))
 			}
 			if got := calls.Load(); got != 1 {
 				t.Errorf("attempts = %d, want 1", got)

@@ -194,9 +194,10 @@ choice back and `Uncertain(err)` tells you when it matters.
 
 A node that refuses a produce outright (one being decommissioned, or
 whose schema validator is busy) answers 503 and stores nothing; the
-client moves to another node without waiting. Since the status alone
-cannot tell that 503 from one that may have stored the message, every
-produce 503 counts as uncertain, and `WithCautiousRetries()` stops at it.
+client moves to another node without waiting, with `WithCautiousRetries()`
+too. It tells those 503s apart by the broker's message. Any other produce
+503, such as a proxy's, may have stored the message, so it counts as
+uncertain and `WithCautiousRetries()` stops at it.
 
 ## Logging
 

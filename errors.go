@@ -191,10 +191,10 @@ func Retryable(err error) bool {
 // This is the question that decides whether retrying can duplicate, and
 // the status alone cannot answer it. A 503 means opposite things
 // depending on the operation: on ack and consume the router declined
-// before anything could act, while a produce can get one from a control
-// plane that went away partway through. Getting that backwards would
-// make an ack that never happened look as though it did, which is the
-// one outcome the lease exists to prevent.
+// before anything could act, while a produce can get one from a proxy
+// that gave up after passing the request on. Getting that backwards
+// would make an ack that never happened look as though it did, which is
+// the one outcome the lease exists to prevent.
 func Uncertain(err error) bool {
 	var connErr *ConnError
 	if errors.As(err, &connErr) {
@@ -211,14 +211,28 @@ func Uncertain(err error) bool {
 			// have acted on it.
 			return true
 		case http.StatusServiceUnavailable:
-			// Some produce 503s store nothing (a node being
-			// decommissioned, a busy schema validator), but the status
-			// alone cannot tell those from the one that may have
-			// stored the message, so every produce 503 counts.
-			return apiErr.Op == opProduce || apiErr.Op == opProduceBatch
+			if apiErr.Op != opProduce && apiErr.Op != opProduceBatch {
+				return false
+			}
+			// The broker's own produce 503s store nothing, but the
+			// status alone cannot tell them from a proxy's, which may
+			// have passed the request on, so only the broker's
+			// messages make a produce 503 certain.
+			return !storedNothing(apiErr.Message)
 		}
 	}
 	return false
+}
+
+// storedNothing reports whether a produce 503's message is one the
+// broker sends before anything is written: a node being decommissioned,
+// or a schema validation that never ran for want of a slot. The texts
+// are the broker's, from its 3.1.0 release on, which is also the first
+// release that answers a produce with 503 at all. A batch produce may
+// prefix them with the message they are about.
+func storedNothing(message string) bool {
+	return strings.Contains(message, "being decommissioned and takes no new produce") ||
+		strings.Contains(message, "schema validation slot")
 }
 
 // errorKind is the sentinel for a reply, refined by the server's

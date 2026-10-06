@@ -386,12 +386,12 @@ func TestProduceBatchFollowsTheProduceRetryRules(t *testing.T) {
 		}
 	})
 
-	t.Run("cautious retries stop at a 503", func(t *testing.T) {
+	t.Run("cautious retries stop at a 503 that may have stored it", func(t *testing.T) {
 		t.Parallel()
 		var calls atomic.Int32
 		c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 			calls.Add(1)
-			writeBrokerError(w, http.StatusServiceUnavailable, nothingStored503s[1].message)
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		}, WithRetries(4), WithCautiousRetries())
 		err := c.ProduceBatch(context.Background(), "orders", newBatch())
 		if !errors.Is(err, ErrUnavailable) || !Uncertain(err) {

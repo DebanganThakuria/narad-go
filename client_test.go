@@ -279,6 +279,11 @@ func TestClassification(t *testing.T) {
 		{"unavailable on ack", &Error{Status: 503, Op: opAck}, true, false},
 		{"unavailable on consume", &Error{Status: 503, Op: opConsume}, true, false},
 		{"unavailable on produce", &Error{Status: 503, Op: opProduce}, true, true},
+		{"unavailable on produce batch", &Error{Status: 503, Op: opProduceBatch}, true, true},
+		{"draining node on produce", &Error{Status: 503, Op: opProduce,
+			Message: "this node is being decommissioned and takes no new produce; send it to another node"}, true, false},
+		{"busy schema validator on produce batch", &Error{Status: 503, Op: opProduceBatch,
+			Message: "message 2: schema: payload not validated: context deadline exceeded while waiting for a schema validation slot"}, true, false},
 	}
 	for _, tc := range cases {
 		if got := Retryable(tc.err); got != tc.retryable {

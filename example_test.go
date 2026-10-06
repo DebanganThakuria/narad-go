@@ -249,7 +249,7 @@ func ExampleClient_ProduceBatch() {
 	for _, order := range orders {
 		err := batch.Add(order, narad.WithKey(order.ID))
 		if errors.Is(err, narad.ErrBatchFull) {
-			if _, err := client.ProduceBatch(ctx, "orders", &batch); err != nil {
+			if err := client.ProduceBatch(ctx, "orders", &batch); err != nil {
 				log.Fatal(err)
 			}
 			batch = narad.Batch{}
@@ -259,7 +259,7 @@ func ExampleClient_ProduceBatch() {
 			log.Fatal(err)
 		}
 	}
-	if _, err := client.ProduceBatch(ctx, "orders", &batch); err != nil {
+	if err := client.ProduceBatch(ctx, "orders", &batch); err != nil {
 		log.Fatal(err)
 	}
 }

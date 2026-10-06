@@ -149,12 +149,8 @@ func TestProduceBatchStoresEachMessageAsProduceWould(t *testing.T) {
 		t.Fatalf("Len = %d, want %d", batch.Len(), len(cases))
 	}
 
-	accepted, err := c.ProduceBatch(context.Background(), "orders", &batch)
-	if err != nil {
+	if err := c.ProduceBatch(context.Background(), "orders", &batch); err != nil {
 		t.Fatalf("ProduceBatch: %v", err)
-	}
-	if accepted != len(cases) {
-		t.Errorf("accepted = %d, want %d", accepted, len(cases))
 	}
 
 	b.mu.Lock()
@@ -203,7 +199,7 @@ func TestBatchEnvelopeIDsAreFixedWhenAdded(t *testing.T) {
 	// Sending the same batch twice, as a caller resolving an uncertain
 	// failure would, must send the same ids so consumers can tell.
 	for range 2 {
-		if _, err := c.ProduceBatch(context.Background(), "orders", &batch); err != nil {
+		if err := c.ProduceBatch(context.Background(), "orders", &batch); err != nil {
 			t.Fatalf("ProduceBatch: %v", err)
 		}
 	}
@@ -305,15 +301,15 @@ func TestProduceBatchRefusesAnEmptyBatchWithoutSending(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	})
 	ctx := context.Background()
-	if _, err := c.ProduceBatch(ctx, "orders", nil); !errors.Is(err, ErrBadRequest) {
+	if err := c.ProduceBatch(ctx, "orders", nil); !errors.Is(err, ErrBadRequest) {
 		t.Errorf("nil batch = %v, want ErrBadRequest", err)
 	}
-	if _, err := c.ProduceBatch(ctx, "orders", &Batch{}); !errors.Is(err, ErrBadRequest) {
+	if err := c.ProduceBatch(ctx, "orders", &Batch{}); !errors.Is(err, ErrBadRequest) {
 		t.Errorf("empty batch = %v, want ErrBadRequest", err)
 	}
 	var one Batch
 	_ = one.Add(order{ID: "o1"})
-	if _, err := c.ProduceBatch(ctx, "", &one); !errors.Is(err, ErrBadRequest) {
+	if err := c.ProduceBatch(ctx, "", &one); !errors.Is(err, ErrBadRequest) {
 		t.Errorf("no topic = %v, want ErrBadRequest", err)
 	}
 	if calls.Load() != 0 {
@@ -336,7 +332,7 @@ func TestProduceBatchReportsTheRefusedMessage(t *testing.T) {
 	_ = batch.Add(order{ID: "o1"})
 	_ = batch.Add(map[string]string{"amount": "lots"})
 
-	_, err := c.ProduceBatch(context.Background(), "orders", &batch)
+	err := c.ProduceBatch(context.Background(), "orders", &batch)
 	if !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("err = %v, want ErrBadRequest", err)
 	}
@@ -381,7 +377,7 @@ func TestProduceBatchFollowsTheProduceRetryRules(t *testing.T) {
 		defer c.Close()
 		for range 3 {
 			start := time.Now()
-			if _, err := c.ProduceBatch(context.Background(), "orders", newBatch()); err != nil {
+			if err := c.ProduceBatch(context.Background(), "orders", newBatch()); err != nil {
 				t.Fatalf("ProduceBatch: %v", err)
 			}
 			if took := time.Since(start); took > 500*time.Millisecond {
@@ -397,7 +393,7 @@ func TestProduceBatchFollowsTheProduceRetryRules(t *testing.T) {
 			calls.Add(1)
 			writeBrokerError(w, http.StatusServiceUnavailable, nothingStored503s[1].message)
 		}, WithRetries(4), WithCautiousRetries())
-		_, err := c.ProduceBatch(context.Background(), "orders", newBatch())
+		err := c.ProduceBatch(context.Background(), "orders", newBatch())
 		if !errors.Is(err, ErrUnavailable) || !Uncertain(err) {
 			t.Fatalf("err = %v, want an uncertain ErrUnavailable", err)
 		}
@@ -418,9 +414,8 @@ func TestProduceBatchFollowsTheProduceRetryRules(t *testing.T) {
 			}
 			accept(w, r)
 		})
-		accepted, err := c.ProduceBatch(context.Background(), "orders", newBatch())
-		if err != nil || accepted != 2 {
-			t.Fatalf("ProduceBatch = %d, %v; want 2, nil", accepted, err)
+		if err := c.ProduceBatch(context.Background(), "orders", newBatch()); err != nil {
+			t.Fatalf("ProduceBatch: %v", err)
 		}
 		if calls.Load() != 2 {
 			t.Errorf("attempts = %d, want 2", calls.Load())
@@ -431,9 +426,26 @@ func TestProduceBatchFollowsTheProduceRetryRules(t *testing.T) {
 		t.Parallel()
 		// A 3.0.x router has no such route.
 		c := newTestClient(t, http.NotFound)
-		_, err := c.ProduceBatch(context.Background(), "orders", newBatch())
+		err := c.ProduceBatch(context.Background(), "orders", newBatch())
 		if !errors.Is(err, ErrNotFound) || Retryable(err) {
 			t.Fatalf("err = %v, want a non-retryable ErrNotFound", err)
 		}
 	})
+}
+
+// A batch is stored whole or not at all, so a count of accepted
+// messages could only ever be zero or all of them. ProduceBatch reports
+// the one thing that varies: whether it failed.
+func TestProduceBatchReportsOnlyAnError(t *testing.T) {
+	t.Parallel()
+
+	b := &batchBroker{}
+	c := newTestClient(t, b.handler())
+	var produce func(context.Context, string, *Batch) error = c.ProduceBatch
+
+	var batch Batch
+	_ = batch.Add(order{ID: "o1"})
+	if err := produce(context.Background(), "orders", &batch); err != nil {
+		t.Fatalf("ProduceBatch: %v", err)
+	}
 }

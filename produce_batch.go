@@ -38,7 +38,7 @@ const (
 //			return err
 //		}
 //	}
-//	_, err := client.ProduceBatch(ctx, "orders", &batch)
+//	err := client.ProduceBatch(ctx, "orders", &batch)
 //
 // A Batch is not safe for concurrent use.
 type Batch struct {
@@ -144,8 +144,7 @@ func batchElement(payload []byte, contentType string, cfg produceConfig) []byte 
 // ProduceBatch sends every message in the batch and returns once the
 // broker has all of them on disk. It is all or nothing: a message the
 // broker refuses fails the whole batch, the error's message names it
-// ("message 3: ..."), and nothing is stored. It returns how many
-// messages the broker accepted, which on success is all of them.
+// ("message 3: ..."), and nothing is stored.
 //
 // Use it when messages belong together, or to cut the cost of producing
 // many at once: one request and one disk sync carry up to [MaxBatch]
@@ -160,14 +159,16 @@ func batchElement(payload []byte, contentType string, cfg produceConfig) []byte 
 //
 // A broker older than 3.1.0 has no batch endpoint and answers
 // [ErrNotFound]. Fall back to Produce there, knowing it is not atomic.
-func (c *Client) ProduceBatch(ctx context.Context, topic string, batch *Batch) (int, error) {
+func (c *Client) ProduceBatch(ctx context.Context, topic string, batch *Batch) error {
 	if topic == "" {
-		return 0, fmt.Errorf("narad: produce batch: %w: topic is required", ErrBadRequest)
+		return fmt.Errorf("narad: produce batch: %w: topic is required", ErrBadRequest)
 	}
 	if batch == nil || batch.Len() == 0 {
-		return 0, fmt.Errorf("narad: produce batch %s: %w: the batch is empty", topic, ErrBadRequest)
+		return fmt.Errorf("narad: produce batch %s: %w: the batch is empty", topic, ErrBadRequest)
 	}
-	res, err := c.do(ctx, call{
+	// The reply's count of accepted messages is always the whole batch,
+	// so there is nothing in it to read.
+	_, err := c.do(ctx, call{
 		method:      http.MethodPost,
 		path:        "/v1/topics/" + url.PathEscape(topic) + "/produce/batch",
 		body:        batch.body(),
@@ -176,14 +177,5 @@ func (c *Client) ProduceBatch(ctx context.Context, topic string, batch *Batch) (
 		topic:       topic,
 		ok:          []int{http.StatusAccepted},
 	})
-	if err != nil {
-		return 0, err
-	}
-	var reply struct {
-		Accepted int `json:"accepted"`
-	}
-	if err := decode(res.body, &reply, opProduceBatch); err != nil {
-		return 0, err
-	}
-	return reply.Accepted, nil
+	return err
 }

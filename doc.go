@@ -58,7 +58,7 @@ batches without changing its handler. Both need Narad 3.1.0.
 			return err
 		}
 	}
-	_, err = client.ProduceBatch(ctx, "orders", &batch)
+	err = client.ProduceBatch(ctx, "orders", &batch)
 
 # At-least-once, and what it asks of you
 

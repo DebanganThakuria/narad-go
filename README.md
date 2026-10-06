@@ -90,7 +90,7 @@ for _, order := range orders {
         return err // narad.ErrBatchFull past 100 messages or 1 MiB
     }
 }
-accepted, err := client.ProduceBatch(ctx, "orders", &batch)
+err := client.ProduceBatch(ctx, "orders", &batch)
 ```
 
 `Add` takes what `Produce` takes, per message. If the broker refuses one

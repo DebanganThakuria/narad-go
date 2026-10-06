@@ -209,12 +209,8 @@ func TestIntegration(t *testing.T) {
 				t.Fatalf("Add %d: %v", i, err)
 			}
 		}
-		accepted, err := client.ProduceBatch(ctx, name, &batch)
-		if err != nil {
+		if err := client.ProduceBatch(ctx, name, &batch); err != nil {
 			t.Fatalf("ProduceBatch: %v", err)
-		}
-		if accepted != count {
-			t.Errorf("accepted = %d, want %d", accepted, count)
 		}
 
 		seen := newSeenSet(count)
@@ -271,7 +267,7 @@ func TestIntegration(t *testing.T) {
 		var batch narad.Batch
 		_ = batch.Add(payment{ID: "pay_ok", Amount: 1})
 		_ = batch.Add(map[string]any{"id": "pay_bad", "amount": "lots"})
-		_, err := client.ProduceBatch(ctx, name, &batch)
+		err := client.ProduceBatch(ctx, name, &batch)
 		if !errors.Is(err, narad.ErrBadRequest) {
 			t.Fatalf("ProduceBatch with a bad message = %v, want ErrBadRequest", err)
 		}

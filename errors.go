@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -11,7 +12,9 @@ import (
 // status codes or reading messages.
 var (
 	// ErrBadRequest means the server rejected the request as malformed.
-	// Sending it again unchanged will fail the same way.
+	// Sending it again unchanged will fail the same way. Among the
+	// reasons: a payload nested deeper than 256 levels on a topic with a
+	// schema, and a new topic name over 200 bytes.
 	ErrBadRequest = errors.New("narad: bad request")
 
 	// ErrUnauthenticated means the credentials were missing or wrong.
@@ -28,8 +31,23 @@ var (
 	// ErrExists means the state you assumed is not the state that is
 	// there. Creating a topic that already exists reports it, which is
 	// why EnsureTopic treats it as success, and so does a conditional
-	// schema update whose base version is no longer current.
+	// schema update whose base version is no longer current. The two
+	// more specific conflicts below match it as well.
 	ErrExists = errors.New("narad: already exists")
+
+	// ErrNameTaken means a topic could not be created because one whose
+	// name differs only in letter case already exists. The two would
+	// share a directory on a case-insensitive filesystem, so the broker
+	// refuses the second. Choose another name. It also matches
+	// [ErrExists], though the topic you asked for does not exist.
+	ErrNameTaken = errors.New("narad: topic name taken in another letter case")
+
+	// ErrTopicChanged means the topic was changed underneath the
+	// request, twice, while the broker was applying it: deleted and
+	// recreated, or given more partitions. Read the topic again and
+	// decide whether the change still makes sense. It also matches
+	// [ErrExists].
+	ErrTopicChanged = errors.New("narad: topic changed since it was read")
 
 	// ErrLeaseLost means the message's visibility window closed before
 	// the ack arrived, or it was already acked and redelivered under a
@@ -52,12 +70,14 @@ var (
 	ErrTooLarge = errors.New("narad: message too large")
 
 	// ErrThrottled means the server is shedding load, or this identity
-	// has too many consumes in flight. Back off, or use fewer workers.
+	// has too many consumes or produces in flight, or too many failed
+	// logins have been seen lately. Back off, or use fewer workers.
 	ErrThrottled = errors.New("narad: throttled")
 
-	// ErrUnavailable means this node could not serve the request now,
-	// usually because a partition's owner is down. Another node, or the
-	// same one later, may do better.
+	// ErrUnavailable means this node could not serve the request now:
+	// a partition's owner is down, the node is being decommissioned, or
+	// its schema validator is busy. Another node, or the same one later,
+	// may do better, and the client tries another node by itself.
 	ErrUnavailable = errors.New("narad: unavailable")
 
 	// ErrServer means the server failed internally.
@@ -191,11 +211,41 @@ func Uncertain(err error) bool {
 			// have acted on it.
 			return true
 		case http.StatusServiceUnavailable:
+			// Some produce 503s store nothing (a node being
+			// decommissioned, a busy schema validator), but the status
+			// alone cannot tell those from the one that may have
+			// stored the message, so every produce 503 counts.
 			return apiErr.Op == opProduce
 		}
 	}
 	return false
 }
+
+// errorKind is the sentinel for a reply, refined by the server's
+// message where one status covers conflicts a caller acts on
+// differently. The texts matched are the broker's, from its 3.1.0
+// release on.
+func errorKind(status int, message string) error {
+	kind := statusError(status)
+	if status != http.StatusConflict {
+		return kind
+	}
+	switch {
+	case strings.Contains(message, "differs only in letter case"):
+		return kinds{ErrNameTaken, ErrExists}
+	case strings.Contains(message, "topic changed since it was read"):
+		return kinds{ErrTopicChanged, ErrExists}
+	}
+	return kind
+}
+
+// kinds lets one reply match more than one sentinel, so a refinement
+// such as ErrNameTaken does not stop errors.Is(err, ErrExists) from
+// finding what it always found.
+type kinds []error
+
+func (k kinds) Error() string   { return k[0].Error() }
+func (k kinds) Unwrap() []error { return k }
 
 // statusError maps a status to its sentinel.
 func statusError(status int) error {

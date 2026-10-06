@@ -259,8 +259,11 @@ func ExampleClient_ProduceBatch() {
 			log.Fatal(err)
 		}
 	}
-	if err := client.ProduceBatch(ctx, "orders", &batch); err != nil {
-		log.Fatal(err)
+	// An empty batch is refused, and there is nothing to send anyway.
+	if batch.Len() > 0 {
+		if err := client.ProduceBatch(ctx, "orders", &batch); err != nil {
+			log.Fatal(err)
+		}
 	}
 }
 

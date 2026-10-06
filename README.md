@@ -105,7 +105,10 @@ not change: it still sees one message at a time, the batch's leases are
 renewed together in one request per round while their messages wait, a
 failure is handed back at once, and each message's ack outcome is
 reported on its own, a lost lease included. On shutdown the messages
-already handled are acked at once.
+already handled are acked at once and the ones not yet started are
+handed back at once. A message the client cannot decode costs only
+itself: it is reported and left to lapse, and the rest of its batch is
+handled.
 
 Both need Narad 3.1.0. An older broker answers `ProduceBatch` with
 `ErrNotFound`; a consumer with `WithBatch` falls back to one at a time.

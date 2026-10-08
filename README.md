@@ -234,6 +234,10 @@ free of dependencies:
 go get github.com/debanganthakuria/narad-go/prometheus
 ```
 
+It is tagged on its own, as `prometheus/vX.Y.Z`, and names the oldest
+client release it works with; `go get` raises your client to that
+release if yours is older.
+
 Its package is named `prometheus` too, so import it under an alias.
 Register the metrics and hand `Observe` to the client:
 

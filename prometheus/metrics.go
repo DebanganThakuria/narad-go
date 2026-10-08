@@ -1,4 +1,22 @@
-package narad
+// Package prometheus reports a Narad client's activity to Prometheus.
+//
+// It adapts the [narad.Event] stream a client emits through
+// [narad.WithEvents] to metrics registered on a caller-supplied
+// Registerer. It is a module of its own so that the client itself
+// depends on nothing beyond the standard library, and only programs that
+// want these metrics pull the Prometheus client in.
+//
+// The package name matches client_golang's, so import it under an alias:
+//
+//	import (
+//		"github.com/debanganthakuria/narad-go"
+//		naradprom "github.com/debanganthakuria/narad-go/prometheus"
+//		"github.com/prometheus/client_golang/prometheus"
+//	)
+//
+//	metrics := naradprom.NewMetrics(prometheus.DefaultRegisterer)
+//	client, err := narad.New(addr, narad.WithEvents(metrics.Observe))
+package prometheus
 
 import (
 	"errors"
@@ -6,7 +24,8 @@ import (
 	"regexp"
 	"strconv"
 
-	"github.com/prometheus/client_golang/prometheus"
+	narad "github.com/debanganthakuria/narad-go"
+	prom "github.com/prometheus/client_golang/prometheus"
 )
 
 // metricsSubsystem keeps "narad" in every metric name whatever prefix is
@@ -40,8 +59,9 @@ func WithMetricsPrefix(prefix string) MetricsOption {
 
 // Metrics reports a Narad client's activity to Prometheus.
 //
-// Create one per client and pass [Metrics.Observe] to [WithEvents]. It is
-// safe for concurrent use. Four metrics come out of it:
+// Create one per client and pass [Metrics.Observe] to
+// [narad.WithEvents]. It is safe for concurrent use. Four metrics come
+// out of it:
 //
 //	narad_requests_total{op,node,status,outcome}   counter
 //	narad_request_duration_seconds{op,node}        histogram
@@ -51,10 +71,10 @@ func WithMetricsPrefix(prefix string) MetricsOption {
 // The gauge is 1 while a node is being used and 0 while its circuit
 // breaker holds it out.
 type Metrics struct {
-	requests  *prometheus.CounterVec
-	durations *prometheus.HistogramVec
-	retries   *prometheus.CounterVec
-	nodeUp    *prometheus.GaugeVec
+	requests  *prom.CounterVec
+	durations *prom.HistogramVec
+	retries   *prom.CounterVec
+	nodeUp    *prom.GaugeVec
 }
 
 // NewMetrics registers the metrics and returns them.
@@ -62,13 +82,13 @@ type Metrics struct {
 // Pass prometheus.DefaultRegisterer for the usual case, or your own
 // registry:
 //
-//	metrics := narad.NewMetrics(prometheus.DefaultRegisterer)
+//	metrics := naradprom.NewMetrics(prometheus.DefaultRegisterer)
 //	client, err := narad.New(addr, narad.WithEvents(metrics.Observe))
 //
 // It panics if registration fails, which follows MustRegister and suits
 // a call made once at startup. Use [NewMetricsWithError] where a panic
 // is not wanted, such as when the prefix comes from configuration.
-func NewMetrics(reg prometheus.Registerer, opts ...MetricsOption) *Metrics {
+func NewMetrics(reg prom.Registerer, opts ...MetricsOption) *Metrics {
 	m, err := NewMetricsWithError(reg, opts...)
 	if err != nil {
 		panic(err)
@@ -82,7 +102,7 @@ func NewMetrics(reg prometheus.Registerer, opts ...MetricsOption) *Metrics {
 // It reports an invalid prefix, and a registry that already holds these
 // metrics, which is what happens when a process builds two clients
 // without giving them different prefixes.
-func NewMetricsWithError(reg prometheus.Registerer, opts ...MetricsOption) (*Metrics, error) {
+func NewMetricsWithError(reg prom.Registerer, opts ...MetricsOption) (*Metrics, error) {
 	var cfg metricsConfig
 	for _, opt := range opts {
 		opt(&cfg)
@@ -92,14 +112,14 @@ func NewMetricsWithError(reg prometheus.Registerer, opts ...MetricsOption) (*Met
 	}
 
 	m := &Metrics{
-		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
+		requests: prom.NewCounterVec(prom.CounterOpts{
 			Namespace: cfg.namespace,
 			Subsystem: metricsSubsystem,
 			Name:      "requests_total",
 			Help:      "Narad requests by operation, node, status and outcome.",
 		}, []string{"op", "node", "status", "outcome"}),
 
-		durations: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		durations: prom.NewHistogramVec(prom.HistogramOpts{
 			Namespace: cfg.namespace,
 			Subsystem: metricsSubsystem,
 			Name:      "request_duration_seconds",
@@ -112,21 +132,21 @@ func NewMetricsWithError(reg prometheus.Registerer, opts ...MetricsOption) (*Met
 			},
 		}, []string{"op", "node"}),
 
-		retries: prometheus.NewCounterVec(prometheus.CounterOpts{
+		retries: prom.NewCounterVec(prom.CounterOpts{
 			Namespace: cfg.namespace,
 			Subsystem: metricsSubsystem,
 			Name:      "retries_total",
 			Help:      "Narad retries, labelled by whether the failure may already have been applied.",
 		}, []string{"op", "node", "uncertain"}),
 
-		nodeUp: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		nodeUp: prom.NewGaugeVec(prom.GaugeOpts{
 			Namespace: cfg.namespace,
 			Subsystem: metricsSubsystem,
 			Name:      "node_up",
 			Help:      "1 while the client is sending a node requests, 0 while its circuit breaker holds it out.",
 		}, []string{"node"}),
 	}
-	for _, collector := range []prometheus.Collector{m.requests, m.durations, m.retries, m.nodeUp} {
+	for _, collector := range []prom.Collector{m.requests, m.durations, m.retries, m.nodeUp} {
 		if err := reg.Register(collector); err != nil {
 			return nil, fmt.Errorf("narad: register metrics: %w", err)
 		}
@@ -134,10 +154,10 @@ func NewMetricsWithError(reg prometheus.Registerer, opts ...MetricsOption) (*Met
 	return m, nil
 }
 
-// Observe records one client event. Give it to [WithEvents].
-func (m *Metrics) Observe(e Event) {
+// Observe records one client event. Give it to [narad.WithEvents].
+func (m *Metrics) Observe(e narad.Event) {
 	switch e.Kind {
-	case EventRequest:
+	case narad.EventRequest:
 		status := "none"
 		if e.Status != 0 {
 			status = strconv.Itoa(e.Status)
@@ -145,10 +165,10 @@ func (m *Metrics) Observe(e Event) {
 		m.requests.WithLabelValues(e.Op, e.Node, status, outcome(e.Err)).Inc()
 		m.durations.WithLabelValues(e.Op, e.Node).Observe(e.Took.Seconds())
 
-	case EventRetry:
+	case narad.EventRetry:
 		m.retries.WithLabelValues(e.Op, e.Node, strconv.FormatBool(e.Uncertain)).Inc()
 
-	case EventNode:
+	case narad.EventNode:
 		up := 0.0
 		if e.State == "closed" {
 			up = 1
@@ -167,22 +187,22 @@ func outcome(err error) string {
 	switch {
 	case err == nil:
 		return "ok"
-	case errors.Is(err, ErrThrottled):
+	case errors.Is(err, narad.ErrThrottled):
 		return "throttled"
-	case errors.Is(err, ErrUnavailable):
+	case errors.Is(err, narad.ErrUnavailable):
 		return "unavailable"
-	case errors.Is(err, ErrLeaseLost):
+	case errors.Is(err, narad.ErrLeaseLost):
 		return "lease_lost"
-	case errors.Is(err, ErrNotFound), errors.Is(err, ErrExists):
+	case errors.Is(err, narad.ErrNotFound), errors.Is(err, narad.ErrExists):
 		return "not_found"
-	case errors.Is(err, ErrForbidden), errors.Is(err, ErrUnauthenticated):
+	case errors.Is(err, narad.ErrForbidden), errors.Is(err, narad.ErrUnauthenticated):
 		return "denied"
-	case errors.Is(err, ErrBadRequest):
+	case errors.Is(err, narad.ErrBadRequest):
 		return "rejected"
-	case errors.Is(err, ErrServer):
+	case errors.Is(err, narad.ErrServer):
 		return "server_error"
 	}
-	var connErr *ConnError
+	var connErr *narad.ConnError
 	if errors.As(err, &connErr) {
 		return "unreachable"
 	}

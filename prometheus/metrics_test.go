@@ -1,16 +1,18 @@
-package narad
+package prometheus
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
+	narad "github.com/debanganthakuria/narad-go"
+	prom "github.com/prometheus/client_golang/prometheus"
 )
 
 // metricNames collects the metric names a registry holds.
-func metricNames(t *testing.T, reg *prometheus.Registry) []string {
+func metricNames(t *testing.T, reg *prom.Registry) []string {
 	t.Helper()
 	families, err := reg.Gather()
 	if err != nil {
@@ -26,11 +28,11 @@ func metricNames(t *testing.T, reg *prometheus.Registry) []string {
 func TestDefaultMetricNames(t *testing.T) {
 	t.Parallel()
 
-	reg := prometheus.NewRegistry()
+	reg := prom.NewRegistry()
 	m := NewMetrics(reg)
-	m.Observe(Event{Kind: EventRequest, Op: "produce", Node: "n1", Status: 202, Took: time.Millisecond})
-	m.Observe(Event{Kind: EventRetry, Op: "produce", Node: "n1"})
-	m.Observe(Event{Kind: EventNode, Node: "n1", State: "open"})
+	m.Observe(narad.Event{Kind: narad.EventRequest, Op: "produce", Node: "n1", Status: 202, Took: time.Millisecond})
+	m.Observe(narad.Event{Kind: narad.EventRetry, Op: "produce", Node: "n1"})
+	m.Observe(narad.Event{Kind: narad.EventNode, Node: "n1", State: "open"})
 
 	want := map[string]bool{
 		"narad_requests_total":           false,
@@ -57,9 +59,9 @@ func TestDefaultMetricNames(t *testing.T) {
 func TestMetricsPrefixIsPrepended(t *testing.T) {
 	t.Parallel()
 
-	reg := prometheus.NewRegistry()
+	reg := prom.NewRegistry()
 	m := NewMetrics(reg, WithMetricsPrefix("payments"))
-	m.Observe(Event{Kind: EventRequest, Op: "produce", Node: "n1", Status: 202})
+	m.Observe(narad.Event{Kind: narad.EventRequest, Op: "produce", Node: "n1", Status: 202})
 
 	got := metricNames(t, reg)
 	if len(got) == 0 {
@@ -77,7 +79,7 @@ func TestMetricsPrefixIsPrepended(t *testing.T) {
 func TestMetricsPrefixSeparatesTwoClients(t *testing.T) {
 	t.Parallel()
 
-	reg := prometheus.NewRegistry()
+	reg := prom.NewRegistry()
 	if _, err := NewMetricsWithError(reg, WithMetricsPrefix("orders")); err != nil {
 		t.Fatalf("first: %v", err)
 	}
@@ -93,12 +95,12 @@ func TestInvalidMetricsPrefixIsReported(t *testing.T) {
 	t.Parallel()
 
 	for _, bad := range []string{"has space", "1leading-digit", "dash-es", "dot.ted", "$"} {
-		if _, err := NewMetricsWithError(prometheus.NewRegistry(), WithMetricsPrefix(bad)); err == nil {
+		if _, err := NewMetricsWithError(prom.NewRegistry(), WithMetricsPrefix(bad)); err == nil {
 			t.Errorf("prefix %q should have been rejected", bad)
 		}
 	}
 	for _, good := range []string{"payments", "my_app", "_leading_underscore", "app2"} {
-		if _, err := NewMetricsWithError(prometheus.NewRegistry(), WithMetricsPrefix(good)); err != nil {
+		if _, err := NewMetricsWithError(prom.NewRegistry(), WithMetricsPrefix(good)); err != nil {
 			t.Errorf("prefix %q should have been accepted: %v", good, err)
 		}
 	}
@@ -112,7 +114,7 @@ func TestNewMetricsPanicsOnABadPrefix(t *testing.T) {
 			t.Error("NewMetrics should panic on an invalid prefix")
 		}
 	}()
-	NewMetrics(prometheus.NewRegistry(), WithMetricsPrefix("not valid"))
+	NewMetrics(prom.NewRegistry(), WithMetricsPrefix("not valid"))
 }
 
 // The outcome label is what makes the counter actionable: throttling
@@ -123,14 +125,14 @@ func TestOutcomeLabels(t *testing.T) {
 
 	cases := map[string]error{
 		"ok":           nil,
-		"throttled":    ErrThrottled,
-		"unavailable":  ErrUnavailable,
-		"lease_lost":   ErrLeaseLost,
-		"not_found":    ErrNotFound,
-		"denied":       ErrForbidden,
-		"rejected":     ErrBadRequest,
-		"server_error": ErrServer,
-		"unreachable":  &ConnError{Err: errors.New("refused")},
+		"throttled":    narad.ErrThrottled,
+		"unavailable":  narad.ErrUnavailable,
+		"lease_lost":   narad.ErrLeaseLost,
+		"not_found":    narad.ErrNotFound,
+		"denied":       narad.ErrForbidden,
+		"rejected":     narad.ErrBadRequest,
+		"server_error": narad.ErrServer,
+		"unreachable":  &narad.ConnError{Err: errors.New("refused")},
 		"error":        errors.New("something else"),
 	}
 	for want, err := range cases {
@@ -143,21 +145,21 @@ func TestOutcomeLabels(t *testing.T) {
 func TestNodeUpTracksTheBreaker(t *testing.T) {
 	t.Parallel()
 
-	reg := prometheus.NewRegistry()
+	reg := prom.NewRegistry()
 	m := NewMetrics(reg)
-	m.Observe(Event{Kind: EventNode, Node: "n1", State: "open"})
+	m.Observe(narad.Event{Kind: narad.EventNode, Node: "n1", State: "open"})
 
 	value := gaugeValue(t, reg, "narad_node_up")
 	if value != 0 {
 		t.Errorf("node_up = %v while the breaker is open, want 0", value)
 	}
-	m.Observe(Event{Kind: EventNode, Node: "n1", State: "closed"})
+	m.Observe(narad.Event{Kind: narad.EventNode, Node: "n1", State: "closed"})
 	if value := gaugeValue(t, reg, "narad_node_up"); value != 1 {
 		t.Errorf("node_up = %v once the breaker closed, want 1", value)
 	}
 }
 
-func gaugeValue(t *testing.T, reg *prometheus.Registry, name string) float64 {
+func gaugeValue(t *testing.T, reg *prom.Registry, name string) float64 {
 	t.Helper()
 	families, err := reg.Gather()
 	if err != nil {
@@ -182,11 +184,11 @@ func gaugeValue(t *testing.T, reg *prometheus.Registry, name string) float64 {
 func TestRequestWithNoStatusIsCounted(t *testing.T) {
 	t.Parallel()
 
-	reg := prometheus.NewRegistry()
+	reg := prom.NewRegistry()
 	m := NewMetrics(reg)
-	m.Observe(Event{
-		Kind: EventRequest, Op: "produce", Node: "n1",
-		Err: &ConnError{Err: errors.New("reset")},
+	m.Observe(narad.Event{
+		Kind: narad.EventRequest, Op: "produce", Node: "n1",
+		Err: &narad.ConnError{Err: errors.New("reset")},
 	})
 
 	families, err := reg.Gather()
@@ -205,4 +207,15 @@ func TestRequestWithNoStatusIsCounted(t *testing.T) {
 		return
 	}
 	t.Fatal("the request was not counted")
+}
+
+// The client raises ErrUnavailable itself, wrapped, for a partition that
+// cannot be read now, and that counts as unavailable like a node's 503.
+func TestOutcomeOfAClientSideUnavailableIsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	err := fmt.Errorf("narad: replay orders: %w", narad.ErrUnavailable)
+	if got := outcome(err); got != "unavailable" {
+		t.Errorf("outcome(%v) = %q, want unavailable", err, got)
+	}
 }

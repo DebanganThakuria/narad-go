@@ -13,6 +13,10 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # A go.work would make the root module list the prometheus module
+      # as well, and the stdlib-only check below would fail on it.
+      GOWORK: "off"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,8 +37,47 @@ jobs:
             exit 1
           fi
 
+      # The client promises to depend on nothing beyond the standard
+      # library; the Prometheus metrics live in their own module.
+      - name: Core is stdlib-only
+        run: |
+          mods="$(go list -m all)"
+          if [[ "$mods" != "github.com/debanganthakuria/narad-go" ]]; then
+            echo "the root module requires other modules:"
+            echo "$mods"
+            exit 1
+          fi
+          if [[ -e go.sum ]]; then
+            echo "the root module has a go.sum, so it has dependencies"
+            exit 1
+          fi
+          deps="$(go list -deps -test -f '{{if not .Standard}}{{.ImportPath}}{{end}}' ./... \
+            | grep -v '^github.com/debanganthakuria/narad-go' || true)"
+          if [[ -n "$deps" ]]; then
+            echo "the root module imports packages outside the standard library:"
+            echo "$deps"
+            exit 1
+          fi
+
+      - name: Tidy
+        run: go mod tidy -diff
+
       - name: Vet
         run: go vet ./...
 
       - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Tidy prometheus
+        working-directory: prometheus
+        run: |
+          go mod tidy -diff
+          go mod verify
+
+      - name: Vet prometheus
+        working-directory: prometheus
+        run: go vet ./...
+
+      - name: Test prometheus
+        working-directory: prometheus
         run: go test -race -count=1 ./...

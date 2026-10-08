@@ -86,6 +86,14 @@ strings:
 answered. A read changes nothing on the server, so it is never
 uncertain, and [WithCautiousRetries] still retries one that failed.
 
+# Metrics
+
+[WithEvents] reports every request, retry and circuit-breaker change as
+an [Event], for metrics and logging. Ready-made Prometheus metrics live
+in the separate github.com/debanganthakuria/narad-go/prometheus module,
+so this package depends on nothing beyond the standard library and only
+programs that want those metrics pull the Prometheus client in.
+
 # What this package will not do for you
 
 It will not give you ordering, because Narad does not have it. It will

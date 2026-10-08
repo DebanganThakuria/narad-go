@@ -131,6 +131,22 @@ func (n *node) observe(err error) {
 	n.fail(err)
 }
 
+// abandon records a request whose caller stopped waiting: no answer
+// about the node, so its breaker keeps its state. A half-open probe is
+// handed back, so the next request may ask the question instead of the
+// node waiting for an answer that will never come.
+func (n *node) abandon() {
+	if n.failAfter <= 0 {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.state == halfOpen {
+		n.openedAt = n.now().Add(-n.openFor)
+		n.setState(open)
+	}
+}
+
 func (n *node) succeed() {
 	n.mu.Lock()
 	defer n.mu.Unlock()

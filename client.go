@@ -227,7 +227,15 @@ func (c *Client) do(ctx context.Context, rc call) (*reply, error) {
 		tried[node.address] = true
 
 		res, err := c.attempt(ctx, node, rc, attempt)
-		node.observe(err)
+		if err != nil && ctx.Err() != nil {
+			// The caller stopped waiting (its context ended), which says
+			// nothing about the node. Stopping a Consume cancels every
+			// long-poll it has in flight; counting those would open
+			// every breaker and fail the caller's next call.
+			node.abandon()
+		} else {
+			node.observe(err)
+		}
 		if err == nil {
 			return res, nil
 		}

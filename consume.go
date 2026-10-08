@@ -606,7 +606,9 @@ func errorIs(err, target error) bool { return errors.Is(err, target) }
 // Offsets that have aged out of retention are skipped rather than
 // reported, because a replay that starts before the retention window is
 // the normal case and stopping on it would be useless. A handler error
-// stops the read and is returned.
+// stops the read and is returned, and so does a read that still fails
+// after the client's own retries: unlike [Client.Replay], ReadFrom does
+// not wait for a partition to come back.
 //
 //	err := client.ReadFrom(ctx, "orders", 0, 0, narad.HandlerFunc(
 //		func(ctx context.Context, msg *narad.Message) error {
@@ -616,6 +618,13 @@ func (c *Client) ReadFrom(ctx context.Context, topic string, partition int, offs
 	if h == nil {
 		return fmt.Errorf("narad: read %s: %w: handler is required", topic, ErrBadRequest)
 	}
+	return c.readFrom(ctx, topic, partition, offset, h, nil)
+}
+
+// readFrom is ReadFrom, waiting out a failed read under p when p is not
+// nil. A read retried that way resumes at the offset that failed, so
+// nothing already handed to h is handed over again.
+func (c *Client) readFrom(ctx context.Context, topic string, partition int, offset int64, h Handler, p *patience) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -624,14 +633,19 @@ func (c *Client) ReadFrom(ctx context.Context, topic string, partition int, offs
 		switch {
 		case errorIs(err, ErrOffsetGone):
 			// Aged out. The next one may still be there.
+			p.reset()
 			offset++
 			continue
 		case err != nil:
-			return err
+			if p.wait(ctx, err) {
+				continue
+			}
+			return p.giveUp(ctx, err)
 		case msg == nil:
 			// Caught up with the end of this partition's log.
 			return nil
 		}
+		p.reset()
 		if err := h.Handle(ctx, msg); err != nil {
 			return fmt.Errorf("narad: read %s: %w", msg.describe(), err)
 		}
@@ -655,9 +669,19 @@ func (c *Client) ReadFrom(ctx context.Context, topic string, partition int, offs
 // There is no ordering across partitions. Within one, records come in
 // offset order.
 //
-// While a partition's owner is down it reads nothing and reports
-// [ErrUnavailable], naming the partitions, since that partition's
-// history cannot be read.
+// It never starts reading while a partition cannot be read, since that
+// partition's placeholder offsets would make it look empty. It waits
+// instead, because the usual causes clear by themselves: a topic created
+// a moment ago whose partitions the answering node has not seen assigned
+// yet, or an owner that is down or being moved. A read that fails in
+// transit is waited out the same way and resumes where it failed, so no
+// record is handed over twice. Waits use jittered backoff and honour the
+// server's Retry-After, for as long as ctx allows and at most 30 seconds
+// of continuous failure per partition. Then it returns the last error,
+// [ErrUnavailable] naming the partitions for a topic that stays partial.
+// Pass a ctx deadline to give up sooner. Errors that waiting cannot
+// change, such as [ErrNotFound], [ErrForbidden] and [ErrBadRequest], and
+// the handler's own errors, return at once.
 //
 //	err := client.Replay(ctx, "orders", narad.HandlerFunc(
 //		func(ctx context.Context, msg *narad.Message) error {
@@ -668,31 +692,127 @@ func (c *Client) Replay(ctx context.Context, topic string, h Handler) error {
 	if h == nil {
 		return fmt.Errorf("narad: replay %s: %w: handler is required", topic, ErrBadRequest)
 	}
-	info, err := c.Topic(ctx, topic)
-	if err != nil {
-		return fmt.Errorf("narad: replay %s: %w", topic, err)
-	}
-	// A partition whose owner is down reports placeholder offsets, and
-	// replaying it from those would start at zero and read nothing. Say
-	// so before reading anything, rather than return half a replay.
-	if err := unavailablePartitions(info); err != nil {
-		return fmt.Errorf("narad: replay %s: %w", topic, err)
+	// A partition whose owner is down, or not assigned yet, reports
+	// placeholder offsets, and replaying it from those would start at
+	// zero and read nothing. Wait for every partition to be readable
+	// before reading anything, rather than return half a replay.
+	describe := c.patience(opTopic, topic)
+	var info Topic
+	for {
+		var err error
+		info, err = c.Topic(ctx, topic)
+		if err == nil {
+			err = unavailablePartitions(info)
+		}
+		if err == nil {
+			break
+		}
+		if !describe.wait(ctx, err) {
+			return fmt.Errorf("narad: replay %s: %w", topic, describe.giveUp(ctx, err))
+		}
 	}
 	// The partition stats say where each log starts, so a replay begins
 	// at the oldest record still retained rather than at offset zero and
 	// a long walk through offsets that aged out years ago.
 	if len(info.PartitionStats) == 0 {
 		for partition := range info.Partitions {
-			if err := c.ReadFrom(ctx, topic, partition, 0, h); err != nil {
+			if err := c.readFrom(ctx, topic, partition, 0, h, c.patience(opRead, topic)); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 	for _, stats := range info.PartitionStats {
-		if err := c.ReadFrom(ctx, topic, stats.Index, stats.Oldest, h); err != nil {
+		if err := c.readFrom(ctx, topic, stats.Index, stats.Oldest, h, c.patience(opRead, topic)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// patience lets a replay wait out failures that clear by themselves,
+// for at most cfg.replayPatience of consecutive failure. A nil patience
+// waits for nothing.
+type patience struct {
+	c     *Client
+	op    string
+	topic string
+	// start is when the current run of failures began, zero while there
+	// is none.
+	start time.Time
+	tries int
+}
+
+func (c *Client) patience(op, topic string) *patience {
+	return &patience{c: c, op: op, topic: topic}
+}
+
+// wait sleeps before trying again after err, and reports whether to try
+// again. It reports false at once for an error that waiting cannot
+// change, and for a sleep that would end past the limit, so a long
+// Retry-After ends the wait rather than overrun it.
+func (p *patience) wait(ctx context.Context, err error) bool {
+	if p == nil || ctx.Err() != nil || !Retryable(err) {
+		return false
+	}
+	if p.start.IsZero() {
+		p.start = time.Now()
+	}
+	d := p.c.delay(err, p.tries)
+	floor := p.c.cfg.backoff.base
+	if floor <= 0 {
+		floor = 50 * time.Millisecond
+	}
+	if d < floor {
+		// Full jitter can draw nearly zero, and a loop around a whole
+		// call must never spin.
+		d = floor
+	}
+	if time.Since(p.start)+d > p.c.cfg.replayPatience {
+		return false
+	}
+	node := errNode(err)
+	p.c.emit(Event{
+		Kind: EventRetry, Op: p.op, Topic: p.topic, Node: node,
+		Attempt: p.tries, Wait: d, Err: err, Uncertain: Uncertain(err),
+	})
+	p.c.logger().Warn("narad: replay waiting",
+		"op", p.op, "topic", p.topic, "node", node,
+		"attempt", p.tries+1, "wait", d, "err", err)
+	p.tries++
+	return wait(ctx, d)
+}
+
+// reset ends a run of failures after a success.
+func (p *patience) reset() {
+	if p != nil {
+		p.start, p.tries = time.Time{}, 0
+	}
+}
+
+// giveUp is the error to return once wait has said no: err itself,
+// unless the context ended while waiting on it, which is then what the
+// caller is told about.
+func (p *patience) giveUp(ctx context.Context, err error) error {
+	if p == nil {
+		return err
+	}
+	ctxErr := ctx.Err()
+	if ctxErr == nil || errors.Is(err, ctxErr) {
+		return err
+	}
+	return fmt.Errorf("%w while waiting on: %v", ctxErr, err)
+}
+
+// errNode is the node a failure came from, when it says.
+func errNode(err error) string {
+	var apiErr *Error
+	if errors.As(err, &apiErr) {
+		return apiErr.Node
+	}
+	var connErr *ConnError
+	if errors.As(err, &connErr) {
+		return connErr.Node
+	}
+	return ""
 }

@@ -24,6 +24,9 @@ type config struct {
 	onEvent      func(Event)
 	log          Logger
 	http         *http.Client
+	// replayPatience bounds how long Replay keeps retrying one partition
+	// that cannot be read, counted over consecutive failures.
+	replayPatience time.Duration
 }
 
 // defaults are chosen so that a client created with no options is the
@@ -36,10 +39,11 @@ func defaults() config {
 			base: 50 * time.Millisecond,
 			max:  5 * time.Second,
 		},
-		breakAfter:   5,
-		breakFor:     2 * time.Second,
-		maxIdleConns: 64,
-		userAgent:    userAgent,
+		breakAfter:     5,
+		breakFor:       2 * time.Second,
+		maxIdleConns:   64,
+		userAgent:      userAgent,
+		replayPatience: 30 * time.Second,
 	}
 }
 

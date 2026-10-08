@@ -258,8 +258,13 @@ Topics (`CreateTopic`, `EnsureTopic`, `Topic`, `Topics`, `DeleteTopic`,
 default, and `WithRetentionForever()` keeps records forever (a topic's
 `Retention` of zero reads the same way). While a partition's owner is
 down, `Topic` still answers, with `Partial` set and that partition's
-stats marked unavailable (`PartitionStats.Available`); `Replay` refuses
-such a topic rather than skip the partition it cannot read.
+stats marked unavailable (`PartitionStats.Available`). `Replay` never
+skips a partition it cannot read: it waits for it (with jittered backoff,
+honouring Retry-After, for at most 30 seconds of continuous failure per
+partition and never past your ctx), then reports `ErrUnavailable` naming
+the partitions. The same wait covers a topic created a moment ago, whose
+partitions a node may not have seen assigned yet, and a read that fails
+in transit, which resumes where it failed. `ReadFrom` does not wait.
 
 `Ping` takes the node to probe, because a probe sent through the client's
 own load balancing would answer for whichever node came next. It does not

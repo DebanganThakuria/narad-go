@@ -277,6 +277,11 @@ func (t topicJSON) toTopic() Topic {
 // One that differs from an existing topic's only in letter case is
 // [ErrNameTaken], since on a case-insensitive filesystem the two would
 // share a directory.
+//
+// A new topic's partitions may take a moment to be readable on every
+// node: the broker assigns them owners after the create, and a node
+// that has not seen the assignment yet reports them unavailable.
+// Producing is unaffected, and [Client.Replay] waits for it.
 func (c *Client) CreateTopic(ctx context.Context, name string, opts ...TopicOption) (Topic, error) {
 	var out Topic
 	if name == "" {
@@ -345,6 +350,9 @@ func (c *Client) CreateTopic(ctx context.Context, name string, opts ...TopicOpti
 //
 // A topic whose name differs only in letter case is not the one asked
 // for, so that is reported as [ErrNameTaken] rather than success.
+//
+// It makes no promise that a topic it just created is readable on every
+// node yet; see [Client.CreateTopic].
 func (c *Client) EnsureTopic(ctx context.Context, name string, opts ...TopicOption) (Topic, error) {
 	created, err := c.CreateTopic(ctx, name, opts...)
 	if err == nil {

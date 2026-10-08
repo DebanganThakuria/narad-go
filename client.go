@@ -33,6 +33,9 @@ const (
 	opCreateTopic  = "create topic"
 	opDeleteTopic  = "delete topic"
 	opSetSchema    = "set schema"
+	opTopic        = "topic"
+	opTopics       = "topics"
+	opPing         = "ping"
 )
 
 const (
@@ -525,7 +528,7 @@ func (c *Client) Ping(ctx context.Context, address string) error {
 	_, err = c.attempt(ctx, target, call{
 		method: http.MethodGet,
 		path:   "/readyz",
-		op:     "ping",
+		op:     opPing,
 		ok:     []int{http.StatusOK},
 	}, 0)
 	return err

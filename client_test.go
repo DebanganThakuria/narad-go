@@ -3,6 +3,7 @@ package narad
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -284,6 +285,21 @@ func TestClassification(t *testing.T) {
 			Message: "this node is being decommissioned and takes no new produce; send it to another node"}, true, false},
 		{"busy schema validator on produce batch", &Error{Status: 503, Op: opProduceBatch,
 			Message: "message 2: schema: payload not validated: context deadline exceeded while waiting for a schema validation slot"}, true, false},
+
+		// A read changes nothing, so however it failed it was not applied.
+		{"read cut off mid-flight", &ConnError{Op: opRead, Err: errors.New("reset"), reached: true}, true, false},
+		{"topic lookup cut off mid-flight", &ConnError{Op: opTopic, Err: errors.New("reset"), reached: true}, true, false},
+		{"server error on read", &Error{Status: 500, Op: opRead}, true, false},
+		{"bad gateway on topic lookup", &Error{Status: 502, Op: opTopic}, true, false},
+		{"server error on topic list", &Error{Status: 500, Op: opTopics}, true, false},
+		{"produce cut off mid-flight", &ConnError{Op: opProduce, Err: errors.New("reset"), reached: true}, true, true},
+		{"consume cut off mid-flight", &ConnError{Op: opConsume, Err: errors.New("reset"), reached: true}, true, true},
+
+		// The client's own verdict on a partial topic: the same node, or
+		// another, may answer differently in a moment.
+		{"partition not readable yet", fmt.Errorf("narad: replay orders: %w",
+			unavailablePartitions(Topic{PartitionStats: []PartitionStats{
+				{Index: 2, Status: "owner_unavailable", OwnerLiveness: "unassigned"}}})), true, false},
 	}
 	for _, tc := range cases {
 		if got := Retryable(tc.err); got != tc.retryable {
@@ -315,6 +331,37 @@ func TestCautiousRetriesStopAtUncertainty(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Errorf("attempts = %d, want 1", got)
+	}
+}
+
+// A read changes nothing, so cautious retries have no reason to stop at
+// one that was cut off mid-flight.
+func TestCautiousRetriesStillRetryAReadCutOffMidFlight(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("Hijack: %v", err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}, WithRetries(3), WithCautiousRetries())
+
+	msg, err := c.ReadAt(context.Background(), "orders", 0, 0)
+	if err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	if msg != nil {
+		t.Errorf("msg = %+v, want nil at the end of the log", msg)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("requests = %d, want 2", got)
 	}
 }
 

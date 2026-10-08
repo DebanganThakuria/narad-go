@@ -184,6 +184,12 @@ also match `ErrExists`.
 `*narad.Error` carries the status, the server's message and the node that
 answered. `*narad.ConnError` covers requests that never got a reply.
 
+A read (`ReadAt`, `ReadFrom`, `Replay`, `Topic`, `Topics`, `Ping`)
+changes nothing, so it is never uncertain however it failed, and
+`WithCautiousRetries()` still retries it. `ErrUnavailable` is retryable
+whether a node sent it or the client raised it for a partition that
+cannot be read now.
+
 ## At-least-once, and what it asks of you
 
 **Handlers must be idempotent.** Narad delivers at least once and does

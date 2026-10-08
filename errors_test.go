@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -460,5 +461,21 @@ func TestProduceToADelayedChildIsABadRequest(t *testing.T) {
 				t.Errorf("err = %v, should not be retryable", err)
 			}
 		})
+	}
+}
+
+// A read that never got its answer changed nothing, so its error must
+// not suggest the server applied it. A produce in the same state may
+// have been stored, and still says so.
+func TestReadCutOffMidFlightDoesNotClaimItWasApplied(t *testing.T) {
+	t.Parallel()
+
+	read := &ConnError{Op: opRead, Topic: "orders", Err: context.DeadlineExceeded, reached: true}
+	if strings.Contains(read.Error(), "may have applied") {
+		t.Errorf("read error = %q, want no claim that it was applied", read.Error())
+	}
+	produce := &ConnError{Op: opProduce, Topic: "orders", Err: context.DeadlineExceeded, reached: true}
+	if !strings.Contains(produce.Error(), "may have applied") {
+		t.Errorf("produce error = %q, want it to say it may have been applied", produce.Error())
 	}
 }

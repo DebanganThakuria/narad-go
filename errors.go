@@ -79,6 +79,12 @@ var (
 	// a partition's owner is down, the node is being decommissioned, or
 	// its schema validator is busy. Another node, or the same one later,
 	// may do better, and the client tries another node by itself.
+	//
+	// The client raises it itself for a topic with a partition that
+	// cannot be read now, such as one whose owner is down or, on a topic
+	// created a moment ago, one the node answering has not seen assigned
+	// yet. [Client.Replay] waits for such a partition for a while before
+	// reporting it. [Retryable] is true for it either way.
 	ErrUnavailable = errors.New("narad: unavailable")
 
 	// ErrServer means the server failed internally.
@@ -148,7 +154,7 @@ func (e *ConnError) Error() string {
 	if e.Topic != "" {
 		where += " " + e.Topic
 	}
-	if e.reached {
+	if e.reached && !readOnly(e.Op) {
 		return fmt.Sprintf("narad: %s: %v (the server may have applied it)", where, e.Err)
 	}
 	return fmt.Sprintf("narad: %s: %v", where, e.Err)
@@ -164,6 +170,9 @@ func (e *ConnError) Unwrap() error { return e.Err }
 // also be uncertain, and for anything that changes state those two
 // together mean a retry may duplicate. Ask [Uncertain] as well when that
 // matters.
+//
+// [ErrUnavailable] is retryable whether a node sent it or the client
+// raised it itself, as it does for a partition that cannot be read now.
 func Retryable(err error) bool {
 	var apiErr *Error
 	if errors.As(err, &apiErr) {
@@ -183,7 +192,7 @@ func Retryable(err error) bool {
 	if errors.As(err, &connErr) {
 		return true
 	}
-	return errors.Is(err, ErrNoNodes)
+	return errors.Is(err, ErrNoNodes) || errors.Is(err, ErrUnavailable)
 }
 
 // Uncertain reports whether the server may have carried out the request
@@ -203,13 +212,22 @@ func Retryable(err error) bool {
 // before the answer was lost. A resend can then meet its own change, so
 // a create that worked reports [ErrExists]. Read the topic back before
 // deciding.
+//
+// A read is never uncertain, however it failed: [Client.ReadAt],
+// [Client.ReadFrom], [Client.Replay], [Client.Topic], [Client.Topics]
+// and [Client.Ping] change nothing on the server, so there is nothing a
+// retry could duplicate. A consume is not a read in this sense, since
+// it takes a lease.
 func Uncertain(err error) bool {
 	var connErr *ConnError
 	if errors.As(err, &connErr) {
-		return connErr.reached
+		return connErr.reached && !readOnly(connErr.Op)
 	}
 	var apiErr *Error
 	if errors.As(err, &apiErr) {
+		if readOnly(apiErr.Op) {
+			return false
+		}
 		switch apiErr.Status {
 		case http.StatusInternalServerError:
 			// The server was already working on it.
@@ -239,6 +257,16 @@ func Uncertain(err error) bool {
 			}
 			return false
 		}
+	}
+	return false
+}
+
+// readOnly reports whether an operation changes nothing on the server,
+// so that a failure of it can never have been applied.
+func readOnly(op string) bool {
+	switch op {
+	case opRead, opTopic, opTopics, opPing:
+		return true
 	}
 	return false
 }

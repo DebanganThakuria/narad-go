@@ -83,7 +83,8 @@ strings:
 	errors.Is(err, narad.ErrNotFound) // which assumption was wrong
 
 [Error] carries the status, the server's message and the node that
-answered.
+answered. A read changes nothing on the server, so it is never
+uncertain, and [WithCautiousRetries] still retries one that failed.
 
 # What this package will not do for you
 

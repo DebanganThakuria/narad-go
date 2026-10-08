@@ -373,7 +373,7 @@ func (c *Client) Topic(ctx context.Context, name string) (Topic, error) {
 	res, err := c.do(ctx, call{
 		method: http.MethodGet,
 		path:   "/v1/topics/" + url.PathEscape(name),
-		op:     "topic",
+		op:     opTopic,
 		topic:  name,
 		ok:     []int{http.StatusOK},
 	})
@@ -381,7 +381,7 @@ func (c *Client) Topic(ctx context.Context, name string) (Topic, error) {
 		return out, err
 	}
 	var record topicJSON
-	if err := decode(res.body, &record, "topic"); err != nil {
+	if err := decode(res.body, &record, opTopic); err != nil {
 		return out, err
 	}
 	return record.toTopic(), nil
@@ -403,7 +403,7 @@ func (c *Client) Topics(ctx context.Context) ([]Topic, error) {
 			method: http.MethodGet,
 			path:   "/v1/topics",
 			query:  query.Encode(),
-			op:     "topics",
+			op:     opTopics,
 			ok:     []int{http.StatusOK},
 		})
 		if err != nil {
@@ -413,7 +413,7 @@ func (c *Client) Topics(ctx context.Context) ([]Topic, error) {
 			Topics []topicJSON `json:"topics"`
 			Next   string      `json:"next_page_token"`
 		}
-		if err := decode(res.body, &page, "topics"); err != nil {
+		if err := decode(res.body, &page, opTopics); err != nil {
 			return nil, err
 		}
 		for _, record := range page.Topics {

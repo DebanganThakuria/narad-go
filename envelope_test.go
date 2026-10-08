@@ -75,6 +75,24 @@ func TestProduceSendsKeyAndPartition(t *testing.T) {
 	}
 }
 
+// A keyless message is spread round-robin by the broker, so the client
+// must not send a key parameter at all, not even an empty one.
+func TestProduceWithoutAKeySendsNoKey(t *testing.T) {
+	t.Parallel()
+
+	var query map[string][]string
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		query = r.URL.Query()
+		w.WriteHeader(http.StatusAccepted)
+	})
+	if err := c.Produce(context.Background(), "orders", order{ID: "o1"}); err != nil {
+		t.Fatalf("Produce: %v", err)
+	}
+	if len(query) != 0 {
+		t.Errorf("query = %v, want none", query)
+	}
+}
+
 func TestProduceRejectsBadInput(t *testing.T) {
 	t.Parallel()
 
@@ -367,6 +385,57 @@ func TestRetryCanSendElsewhere(t *testing.T) {
 	}
 	if topic != "orders-parked" {
 		t.Errorf("republished to %q, want orders-parked", topic)
+	}
+}
+
+// A retry goes back under the key the message was produced with, so it
+// lands where the original did. For a binary key that is the decoded
+// bytes, not the base64 the broker sent it as, and for a keyless message
+// it is no key at all.
+func TestRetryKeepsTheProducedKey(t *testing.T) {
+	t.Parallel()
+
+	body, err := wrap([]byte(`{"id":"o1"}`), produceConfig{})
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+	for name, tc := range map[string]struct {
+		keyFields string
+		want      string
+	}{
+		"binary key": {`"key":"AAECg/8=","key_encoding":"base64",`, "\x00\x01\x02\x83\xff"},
+		"plain key":  {`"key":"customer-42",`, "customer-42"},
+		"no key":     {``, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var query map[string][]string
+			c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/produce") {
+					query = r.URL.Query()
+					w.WriteHeader(http.StatusAccepted)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			})
+
+			reply := `{"topic":"orders","partition":1,"offset":2,` + tc.keyFields +
+				`"payload":` + string(body) + `,"timestamp":1700000000,"receipt_handle":"1:2:3"}`
+			msg := &Message{client: c}
+			if err := json.Unmarshal([]byte(reply), msg); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if err := c.Retry(context.Background(), msg, nil, ""); err != nil {
+				t.Fatalf("Retry: %v", err)
+			}
+			keys, sent := query["key"]
+			if sent != (tc.want != "") {
+				t.Fatalf("key sent = %v (%q), want sent = %v", sent, keys, tc.want != "")
+			}
+			if sent && (len(keys) != 1 || keys[0] != tc.want) {
+				t.Errorf("republished with key %q, want %q", keys, tc.want)
+			}
+		})
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -50,6 +51,7 @@ type consumeConfig struct {
 	requeue    bool
 	onError    func(*Message, error)
 	grace      time.Duration
+	batch      int
 }
 
 func consumeDefaults() consumeConfig {
@@ -83,8 +85,9 @@ func FromPartition(partition int) ConsumeOption {
 // It defaults to one.
 //
 // Each worker runs its own poll, because the broker hands out one
-// message per request. Raising this raises the connections held open, so
-// see [WithIdleConnections] if you go far above the default.
+// message per request unless [WithBatch] asks for more. Raising this
+// raises the connections held open, so see [WithIdleConnections] if you
+// go far above the default.
 func WithWorkers(n int) ConsumeOption {
 	return func(c *consumeConfig) { c.workers = n }
 }
@@ -94,7 +97,8 @@ func WithWorkers(n int) ConsumeOption {
 //
 // Only turn it off when handlers are reliably faster than the visibility
 // timeout. Otherwise the message is redelivered underneath the handler
-// and the work is done twice.
+// and the work is done twice. With [WithBatch] the leases of a batch are
+// renewed regardless, since its messages wait on each other.
 func WithoutAutoExtend() ConsumeOption {
 	return func(c *consumeConfig) { c.autoExtend = false }
 }
@@ -112,6 +116,15 @@ func WithoutRequeue() ConsumeOption {
 // WithErrorHandler is called when a handler returns an error, when a
 // lease is lost mid-handler, or when an ack fails after the work
 // succeeded. The message is nil when the failure was not about one.
+//
+// With one worker it is never called twice at once. With [WithWorkers]
+// above one, the workers call it concurrently, so it must be safe for
+// that.
+//
+// With [WithBatch] it is also called for a message the batch brought
+// that this client could not decode. That message carries only its
+// position and receipt, no payload, and is left to wait out its
+// visibility timeout.
 func WithErrorHandler(fn func(msg *Message, err error)) ConsumeOption {
 	return func(c *consumeConfig) { c.onError = fn }
 }
@@ -123,7 +136,8 @@ func WithErrorHandler(fn func(msg *Message, err error)) ConsumeOption {
 // cannot be stopped, and waiting for it means Consume outlives the
 // grace period its orchestrator gave the process, which gets the process
 // killed and every in-flight ack lost. Abandoning the work costs one
-// redelivery instead.
+// redelivery instead; with [WithBatch], the messages the batch already
+// handled are acked as soon as shutdown begins, so that holds there too.
 func WithShutdownGrace(d time.Duration) ConsumeOption {
 	return func(c *consumeConfig) { c.grace = d }
 }
@@ -230,7 +244,8 @@ func (c *Client) Consume(ctx context.Context, topic string, h Handler, opts ...C
 	if cfg.workers < 1 {
 		cfg.workers = 1
 	}
-	if cfg.autoExtend && cfg.visibility <= 0 {
+	// A batch renews its leases whatever autoExtend says; see WithBatch.
+	if (cfg.autoExtend || cfg.batch > 1) && cfg.visibility <= 0 {
 		cfg.visibility = c.visibilityOf(ctx, topic)
 	}
 
@@ -292,7 +307,7 @@ func (c *Client) visibilityOf(ctx context.Context, topic string) time.Duration {
 func (c *Client) worker(pollCtx, workCtx context.Context, topic string, h Handler, cfg consumeConfig) {
 	failures := 0
 	for pollCtx.Err() == nil {
-		msg, err := c.poll(pollCtx, topic, cfg)
+		msgs, err := c.pollMany(pollCtx, topic, cfg)
 		if err != nil {
 			if pollCtx.Err() != nil || errors.Is(err, ErrClosed) {
 				return
@@ -310,10 +325,26 @@ func (c *Client) worker(pollCtx, workCtx context.Context, topic string, h Handle
 			continue
 		}
 		failures = 0
-		if msg != nil {
-			c.dispatch(workCtx, h, msg, cfg)
+		switch {
+		case len(msgs) == 1:
+			c.dispatch(workCtx, h, msgs[0], cfg)
+		case len(msgs) > 1:
+			c.dispatchBatch(pollCtx, workCtx, h, msgs, cfg)
 		}
 	}
+}
+
+// pollMany asks once for messages: up to the batch size with
+// [WithBatch], else one.
+func (c *Client) pollMany(ctx context.Context, topic string, cfg consumeConfig) ([]*Message, error) {
+	if cfg.batch > 1 {
+		return c.pollBatch(ctx, topic, cfg)
+	}
+	msg, err := c.poll(ctx, topic, cfg)
+	if msg == nil || err != nil {
+		return nil, err
+	}
+	return []*Message{msg}, nil
 }
 
 // poll asks once for a message. It returns nil, nil when the wait
@@ -322,30 +353,7 @@ func (c *Client) poll(ctx context.Context, topic string, cfg consumeConfig) (*Me
 	if topic == "" {
 		return nil, fmt.Errorf("narad: consume: %w: topic is required", ErrBadRequest)
 	}
-	query := url.Values{}
-	if cfg.wait > 0 {
-		query.Set("wait", cfg.wait.String())
-	}
-	if cfg.pinned {
-		query.Set("partition", strconv.Itoa(cfg.partition))
-	}
-
-	// The request has to outlive the poll the server was asked to hold,
-	// plus the round trip. The configured timeout would cancel it.
-	timeout := c.cfg.timeout
-	if cfg.wait > 0 {
-		timeout = cfg.wait + 10*time.Second
-	}
-
-	res, err := c.do(ctx, call{
-		method:  http.MethodGet,
-		path:    "/v1/topics/" + url.PathEscape(topic) + "/consume",
-		query:   query.Encode(),
-		op:      opConsume,
-		topic:   topic,
-		ok:      []int{http.StatusOK, http.StatusNoContent},
-		timeout: timeout,
-	})
+	res, err := c.do(ctx, consumeCall(topic, cfg, nil, c.cfg.timeout))
 	if err != nil {
 		return nil, err
 	}
@@ -353,6 +361,35 @@ func (c *Client) poll(ctx context.Context, topic string, cfg consumeConfig) (*Me
 		return nil, nil
 	}
 	return c.decodeMessage(res.body, topic)
+}
+
+// consumeCall builds a queue-style consume, with extra query parameters
+// on top of the wait and the partition.
+func consumeCall(topic string, cfg consumeConfig, extra url.Values, timeout time.Duration) call {
+	query := url.Values{}
+	for name, values := range extra {
+		query[name] = values
+	}
+	if cfg.wait > 0 {
+		query.Set("wait", cfg.wait.String())
+	}
+	if cfg.pinned {
+		query.Set("partition", strconv.Itoa(cfg.partition))
+	}
+	// The request has to outlive the poll the server was asked to hold,
+	// plus the round trip. The configured timeout would cancel it.
+	if cfg.wait > 0 {
+		timeout = cfg.wait + 10*time.Second
+	}
+	return call{
+		method:  http.MethodGet,
+		path:    "/v1/topics/" + url.PathEscape(topic) + "/consume",
+		query:   query.Encode(),
+		op:      opConsume,
+		topic:   topic,
+		ok:      []int{http.StatusOK, http.StatusNoContent},
+		timeout: timeout,
+	}
 }
 
 func (c *Client) decodeMessage(body []byte, topic string) (*Message, error) {
@@ -382,7 +419,10 @@ func (c *Client) dispatch(ctx context.Context, h Handler, msg *Message, cfg cons
 	if !msg.Leased() {
 		return
 	}
-	if keeper != nil && keeper.lost() {
+	// A handler may settle its message itself. Settling it again would
+	// find the receipt spent and report a failure that did not happen.
+	settled := msg.isSettled()
+	if !settled && keeper != nil && keeper.lost() {
 		// The message is already back in the queue. Acking now would
 		// either fail or settle a lease somebody else is holding.
 		lost := fmt.Errorf("narad: %s: %w while the handler was still running", msg.describe(), ErrLeaseLost)
@@ -395,20 +435,20 @@ func (c *Client) dispatch(ctx context.Context, h Handler, msg *Message, cfg cons
 	// Finishing the settle matters more than shutting down promptly: an
 	// ack dropped here becomes a redelivery of work already done. Give
 	// it its own short deadline so it cannot hang.
-	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	settleCtx, cancelSettle := settleContext(ctx)
 	defer cancelSettle()
 
 	if err != nil {
 		c.report(cfg, msg, err)
 		c.logger().Warn("narad: handler failed",
 			"topic", msg.Topic, "id", msg.ID(), "offset", msg.Offset,
-			"requeued", cfg.requeue, "err", err)
-		if cfg.requeue {
-			if nackErr := msg.Nack(settleCtx); nackErr != nil {
-				c.logger().Warn("narad: could not hand the message back, it will wait out its visibility timeout",
-					"topic", msg.Topic, "id", msg.ID(), "err", nackErr)
-			}
+			"requeued", cfg.requeue && !settled, "err", err)
+		if cfg.requeue && !settled {
+			c.handBack(settleCtx, msg)
 		}
+		return
+	}
+	if settled {
 		return
 	}
 	if ackErr := msg.Ack(settleCtx); ackErr != nil {
@@ -417,6 +457,14 @@ func (c *Client) dispatch(ctx context.Context, h Handler, msg *Message, cfg cons
 		c.report(cfg, msg, wrapped)
 		c.logger().Error("narad: ack failed after successful handling",
 			"topic", msg.Topic, "id", msg.ID(), "offset", msg.Offset, "err", ackErr)
+	}
+}
+
+// handBack nacks a failed message so it is redelivered at once.
+func (c *Client) handBack(ctx context.Context, msg *Message) {
+	if err := msg.Nack(ctx); err != nil {
+		c.logger().Warn("narad: could not hand the message back, it will wait out its visibility timeout",
+			"topic", msg.Topic, "id", msg.ID(), "err", err)
 	}
 }
 
@@ -472,13 +520,20 @@ func keepLease(ctx context.Context, cancelHandler context.CancelFunc, msg *Messa
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				if msg.isSettled() {
+					// The handler settled it; there is no lease left
+					// to renew, and a 410 now would not mean it was lost.
+					return
+				}
 				extendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 				err := msg.Extend(extendCtx)
 				cancel()
 				if err == nil {
 					continue
 				}
-				if errorIs(err, ErrLeaseLost) {
+				// A 410 while the handler's own Ack or Nack is in flight
+				// is most likely that settle spending the handle.
+				if errorIs(err, ErrLeaseLost) && !msg.isSettled() && !msg.isSettling() {
 					close(k.gone)
 					cancelHandler()
 					return
@@ -523,6 +578,20 @@ func (e *goneError) Error() string {
 // errors.Is(err, ErrOffsetGone) and errors.As(err, &apiErr) both work.
 func (e *goneError) Unwrap() []error { return []error{ErrOffsetGone, e.cause} }
 
+// unavailablePartitions reports the partitions of a partial topic.
+func unavailablePartitions(info Topic) error {
+	var down []string
+	for _, stats := range info.PartitionStats {
+		if !stats.Available() {
+			down = append(down, fmt.Sprintf("%d (owner %s)", stats.Index, stats.OwnerLiveness))
+		}
+	}
+	if len(down) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: partition %s cannot be read now", ErrUnavailable, strings.Join(down, ", "))
+}
+
 // errorIs is errors.Is, named here so the hot paths read cleanly.
 func errorIs(err, target error) bool { return errors.Is(err, target) }
 
@@ -537,7 +606,9 @@ func errorIs(err, target error) bool { return errors.Is(err, target) }
 // Offsets that have aged out of retention are skipped rather than
 // reported, because a replay that starts before the retention window is
 // the normal case and stopping on it would be useless. A handler error
-// stops the read and is returned.
+// stops the read and is returned, and so does a read that still fails
+// after the client's own retries: unlike [Client.Replay], ReadFrom does
+// not wait for a partition to come back.
 //
 //	err := client.ReadFrom(ctx, "orders", 0, 0, narad.HandlerFunc(
 //		func(ctx context.Context, msg *narad.Message) error {
@@ -547,6 +618,13 @@ func (c *Client) ReadFrom(ctx context.Context, topic string, partition int, offs
 	if h == nil {
 		return fmt.Errorf("narad: read %s: %w: handler is required", topic, ErrBadRequest)
 	}
+	return c.readFrom(ctx, topic, partition, offset, h, nil)
+}
+
+// readFrom is ReadFrom, waiting out a failed read under p when p is not
+// nil. A read retried that way resumes at the offset that failed, so
+// nothing already handed to h is handed over again.
+func (c *Client) readFrom(ctx context.Context, topic string, partition int, offset int64, h Handler, p *patience) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -555,14 +633,19 @@ func (c *Client) ReadFrom(ctx context.Context, topic string, partition int, offs
 		switch {
 		case errorIs(err, ErrOffsetGone):
 			// Aged out. The next one may still be there.
+			p.reset()
 			offset++
 			continue
 		case err != nil:
-			return err
+			if p.wait(ctx, err) {
+				continue
+			}
+			return p.giveUp(ctx, err)
 		case msg == nil:
 			// Caught up with the end of this partition's log.
 			return nil
 		}
+		p.reset()
 		if err := h.Handle(ctx, msg); err != nil {
 			return fmt.Errorf("narad: read %s: %w", msg.describe(), err)
 		}
@@ -586,6 +669,20 @@ func (c *Client) ReadFrom(ctx context.Context, topic string, partition int, offs
 // There is no ordering across partitions. Within one, records come in
 // offset order.
 //
+// It never starts reading while a partition cannot be read, since that
+// partition's placeholder offsets would make it look empty. It waits
+// instead, because the usual causes clear by themselves: a topic created
+// a moment ago whose partitions the answering node has not seen assigned
+// yet, or an owner that is down or being moved. A read that fails in
+// transit is waited out the same way and resumes where it failed, so no
+// record is handed over twice. Waits use jittered backoff and honour the
+// server's Retry-After, for as long as ctx allows and at most 30 seconds
+// of continuous failure per partition. Then it returns the last error,
+// [ErrUnavailable] naming the partitions for a topic that stays partial.
+// Pass a ctx deadline to give up sooner. Errors that waiting cannot
+// change, such as [ErrNotFound], [ErrForbidden] and [ErrBadRequest], and
+// the handler's own errors, return at once.
+//
 //	err := client.Replay(ctx, "orders", narad.HandlerFunc(
 //		func(ctx context.Context, msg *narad.Message) error {
 //			fmt.Println(msg.Partition, msg.Offset, msg.ID())
@@ -595,25 +692,127 @@ func (c *Client) Replay(ctx context.Context, topic string, h Handler) error {
 	if h == nil {
 		return fmt.Errorf("narad: replay %s: %w: handler is required", topic, ErrBadRequest)
 	}
-	info, err := c.Topic(ctx, topic)
-	if err != nil {
-		return fmt.Errorf("narad: replay %s: %w", topic, err)
+	// A partition whose owner is down, or not assigned yet, reports
+	// placeholder offsets, and replaying it from those would start at
+	// zero and read nothing. Wait for every partition to be readable
+	// before reading anything, rather than return half a replay.
+	describe := c.patience(opTopic, topic)
+	var info Topic
+	for {
+		var err error
+		info, err = c.Topic(ctx, topic)
+		if err == nil {
+			err = unavailablePartitions(info)
+		}
+		if err == nil {
+			break
+		}
+		if !describe.wait(ctx, err) {
+			return fmt.Errorf("narad: replay %s: %w", topic, describe.giveUp(ctx, err))
+		}
 	}
 	// The partition stats say where each log starts, so a replay begins
 	// at the oldest record still retained rather than at offset zero and
 	// a long walk through offsets that aged out years ago.
 	if len(info.PartitionStats) == 0 {
 		for partition := range info.Partitions {
-			if err := c.ReadFrom(ctx, topic, partition, 0, h); err != nil {
+			if err := c.readFrom(ctx, topic, partition, 0, h, c.patience(opRead, topic)); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 	for _, stats := range info.PartitionStats {
-		if err := c.ReadFrom(ctx, topic, stats.Index, stats.Oldest, h); err != nil {
+		if err := c.readFrom(ctx, topic, stats.Index, stats.Oldest, h, c.patience(opRead, topic)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// patience lets a replay wait out failures that clear by themselves,
+// for at most cfg.replayPatience of consecutive failure. A nil patience
+// waits for nothing.
+type patience struct {
+	c     *Client
+	op    string
+	topic string
+	// start is when the current run of failures began, zero while there
+	// is none.
+	start time.Time
+	tries int
+}
+
+func (c *Client) patience(op, topic string) *patience {
+	return &patience{c: c, op: op, topic: topic}
+}
+
+// wait sleeps before trying again after err, and reports whether to try
+// again. It reports false at once for an error that waiting cannot
+// change, and for a sleep that would end past the limit, so a long
+// Retry-After ends the wait rather than overrun it.
+func (p *patience) wait(ctx context.Context, err error) bool {
+	if p == nil || ctx.Err() != nil || !Retryable(err) {
+		return false
+	}
+	if p.start.IsZero() {
+		p.start = time.Now()
+	}
+	d := p.c.delay(err, p.tries)
+	floor := p.c.cfg.backoff.base
+	if floor <= 0 {
+		floor = 50 * time.Millisecond
+	}
+	if d < floor {
+		// Full jitter can draw nearly zero, and a loop around a whole
+		// call must never spin.
+		d = floor
+	}
+	if time.Since(p.start)+d > p.c.cfg.replayPatience {
+		return false
+	}
+	node := errNode(err)
+	p.c.emit(Event{
+		Kind: EventRetry, Op: p.op, Topic: p.topic, Node: node,
+		Attempt: p.tries, Wait: d, Err: err, Uncertain: Uncertain(err),
+	})
+	p.c.logger().Warn("narad: replay waiting",
+		"op", p.op, "topic", p.topic, "node", node,
+		"attempt", p.tries+1, "wait", d, "err", err)
+	p.tries++
+	return wait(ctx, d)
+}
+
+// reset ends a run of failures after a success.
+func (p *patience) reset() {
+	if p != nil {
+		p.start, p.tries = time.Time{}, 0
+	}
+}
+
+// giveUp is the error to return once wait has said no: err itself,
+// unless the context ended while waiting on it, which is then what the
+// caller is told about.
+func (p *patience) giveUp(ctx context.Context, err error) error {
+	if p == nil {
+		return err
+	}
+	ctxErr := ctx.Err()
+	if ctxErr == nil || errors.Is(err, ctxErr) {
+		return err
+	}
+	return fmt.Errorf("%w while waiting on: %v", ctxErr, err)
+}
+
+// errNode is the node a failure came from, when it says.
+func errNode(err error) string {
+	var apiErr *Error
+	if errors.As(err, &apiErr) {
+		return apiErr.Node
+	}
+	var connErr *ConnError
+	if errors.As(err, &connErr) {
+		return connErr.Node
+	}
+	return ""
 }

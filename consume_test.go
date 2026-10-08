@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // fakeBroker is just enough of Narad to drive a consumer: a queue of
@@ -671,6 +672,168 @@ func TestPayloadDecoding(t *testing.T) {
 	})
 }
 
+// TestKeyDecoding serves each reply exactly as the broker writes it and
+// reads it back through ReadAt, so the whole decode path is covered, not
+// only the unmarshal.
+func TestKeyDecoding(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		fields  string // the key and payload members of the reply
+		key     string
+		payload string // what Bytes should return
+	}{
+		{
+			name:    "base64 key is decoded",
+			fields:  `"key":"AAECg/8=","key_encoding":"base64","payload":{"id":"o1"}`,
+			key:     "\x00\x01\x02\x83\xff",
+			payload: `{"id":"o1"}`,
+		},
+		{
+			name:    "plain key is kept",
+			fields:  `"key":"customer-42","payload":{"id":"o1"}`,
+			key:     "customer-42",
+			payload: `{"id":"o1"}`,
+		},
+		{
+			// Only the flag says base64. Without it, text that happens
+			// to be valid base64 is still the key.
+			name:    "plain key that looks like base64 is kept",
+			fields:  `"key":"AAECg/8=","payload":{"id":"o1"}`,
+			key:     "AAECg/8=",
+			payload: `{"id":"o1"}`,
+		},
+		{
+			name:    "escaped text key is unescaped",
+			fields:  `"key":"café\t ","payload":{"id":"o1"}`,
+			key:     "café\t ",
+			payload: `{"id":"o1"}`,
+		},
+		{
+			name:    "no key",
+			fields:  `"payload":{"id":"o1"}`,
+			key:     "",
+			payload: `{"id":"o1"}`,
+		},
+		{
+			// A key that is itself JSON is text like any other: it is
+			// not parsed, and the quotes around it are transport.
+			name:    "key that is a JSON object",
+			fields:  `"key":"{\"id\":7}","payload":{"id":"o1"}`,
+			key:     `{"id":7}`,
+			payload: `{"id":"o1"}`,
+		},
+		{
+			name:    "key that is a JSON string",
+			fields:  `"key":"\"quoted\"","payload":{"id":"o1"}`,
+			key:     `"quoted"`,
+			payload: `{"id":"o1"}`,
+		},
+		{
+			name:    "key that is a JSON number",
+			fields:  `"key":"123","payload":{"id":"o1"}`,
+			key:     "123",
+			payload: `{"id":"o1"}`,
+		},
+		{
+			name:    "payload and key both base64",
+			fields:  `"key":"/w==","key_encoding":"base64","payload":"AAE=","payload_encoding":"base64"`,
+			key:     "\xff",
+			payload: "\x00\x01",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"topic":"orders","partition":2,"offset":7,%s,"timestamp":1700000000,"receipt_handle":"2:7:9"}`,
+					tc.fields)
+			})
+
+			msg, err := c.ReadAt(context.Background(), "orders", 2, 7)
+			if err != nil {
+				t.Fatalf("ReadAt: %v", err)
+			}
+			if msg.Key != tc.key {
+				t.Errorf("Key = %q, want %q", msg.Key, tc.key)
+			}
+			raw, err := msg.Bytes()
+			if err != nil {
+				t.Fatalf("Bytes: %v", err)
+			}
+			if string(raw) != tc.payload {
+				t.Errorf("Bytes() = %q, want %q", raw, tc.payload)
+			}
+			// The rest of the message decodes as before, and the handle
+			// back to the client survives the custom decoding.
+			if msg.Topic != "orders" || msg.Partition != 2 || msg.Offset != 7 ||
+				msg.Timestamp != 1700000000 || msg.Receipt != "2:7:9" {
+				t.Errorf("message decoded as %+v", msg)
+			}
+			if msg.client != c {
+				t.Error("the decoded message lost its client, so it cannot be settled")
+			}
+		})
+	}
+}
+
+func TestKeyDecodingRejectsWhatItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	for name, fields := range map[string]string{
+		"corrupt base64":   `"key":"!!!","key_encoding":"base64"`,
+		"unknown encoding": `"key":"ff","key_encoding":"hex"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var m Message
+			err := json.Unmarshal([]byte(`{"topic":"orders",`+fields+`,"payload":{}}`), &m)
+			if err == nil {
+				t.Fatalf("decoded key %q, want an error rather than a guess", m.Key)
+			}
+		})
+	}
+}
+
+func TestMessageJSONRoundTripKeepsTheKey(t *testing.T) {
+	t.Parallel()
+
+	for _, key := range []string{"\x00\x01\x02\x83\xff", "customer-42", `{"id":7}`, ""} {
+		in := Message{Topic: "orders", Partition: 1, Offset: 3, Key: key,
+			Payload: json.RawMessage(`"AAE="`), Encoding: "base64"}
+		out, err := json.Marshal(in)
+		if err != nil {
+			t.Fatalf("Marshal(key %q): %v", key, err)
+		}
+		// The wire form matches the broker's: flagged only when binary,
+		// and no key member at all for a keyless message.
+		var fields map[string]any
+		if err := json.Unmarshal(out, &fields); err != nil {
+			t.Fatalf("Marshal(key %q) wrote %s: %v", key, out, err)
+		}
+		_, hasKey := fields["key"]
+		if hasKey != (key != "") {
+			t.Errorf("key %q: wrote %s", key, out)
+		}
+		if binary := key != "" && !utf8.ValidString(key); (fields["key_encoding"] == "base64") != binary {
+			t.Errorf("key %q: wrote %s, binary=%v", key, out, binary)
+		}
+
+		var back Message
+		if err := json.Unmarshal(out, &back); err != nil {
+			t.Fatalf("Unmarshal(%s): %v", out, err)
+		}
+		if back.Key != key {
+			t.Errorf("key %q came back as %q", key, back.Key)
+		}
+		if raw, err := back.Bytes(); err != nil || string(raw) != "\x00\x01" {
+			t.Errorf("payload came back as %q, err %v", raw, err)
+		}
+	}
+}
+
 // logBroker serves ReadAt against an in-memory log, so replay can be
 // tested against something that behaves like a partitioned topic.
 type logBroker struct {
@@ -678,6 +841,17 @@ type logBroker struct {
 	records map[int]map[int64]string
 	// oldest is the first offset each partition still retains.
 	oldest map[int]int64
+
+	// unavailable, when set, is asked on every topic lookup which
+	// partitions the answering node cannot report, and why, the way a
+	// node does for an owner that is down or not assigned yet.
+	unavailable func() map[int]string
+	// fault, when set, may answer a read itself instead of the log, and
+	// reports whether it did.
+	fault func(w http.ResponseWriter, partition int, offset int64) bool
+
+	lookups atomic.Int32
+	reads   atomic.Int32
 }
 
 func (b *logBroker) handler() http.HandlerFunc {
@@ -685,19 +859,33 @@ func (b *logBroker) handler() http.HandlerFunc {
 		if !strings.HasSuffix(r.URL.Path, "/consume") {
 			// Topic lookup, with the stats replay uses to find the start
 			// of each log.
+			b.lookups.Add(1)
+			var down map[int]string
+			if b.unavailable != nil {
+				down = b.unavailable()
+			}
 			w.Header().Set("Content-Type", "application/json")
 			stats := make([]string, 0, len(b.records))
 			for partition := range b.records {
+				if why, ok := down[partition]; ok {
+					stats = append(stats, fmt.Sprintf(
+						`{"index":%d,"oldest_offset":0,"status":"owner_unavailable","owner_liveness":%q}`, partition, why))
+					continue
+				}
 				stats = append(stats, fmt.Sprintf(
 					`{"index":%d,"oldest_offset":%d}`, partition, b.oldest[partition]))
 			}
-			fmt.Fprintf(w, `{"name":"orders","partitions":%d,"partition_stats":[%s]}`,
-				len(b.records), strings.Join(stats, ","))
+			fmt.Fprintf(w, `{"name":"orders","partitions":%d,"partition_stats":[%s],"partial":%v}`,
+				len(b.records), strings.Join(stats, ","), len(down) > 0)
 			return
 		}
 
+		b.reads.Add(1)
 		partition, _ := strconv.Atoi(r.URL.Query().Get("partition"))
 		offset, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
+		if b.fault != nil && b.fault(w, partition, offset) {
+			return
+		}
 		body, ok := b.records[partition][offset]
 		if !ok {
 			// Below the retained window means gone; at or above the end
@@ -877,5 +1065,332 @@ func TestReplayStopsOnContextCancellation(t *testing.T) {
 	}
 	if count > 10 {
 		t.Errorf("handled %d records after cancellation", count)
+	}
+}
+
+// newReplayClient serves b with retries fast enough that a replay's
+// waiting costs a test milliseconds, and Replay's patience set to
+// patience when it is not zero.
+func newReplayClient(t *testing.T, b *logBroker, patience time.Duration, opts ...Option) *Client {
+	t.Helper()
+	base := []Option{WithBackoff(time.Millisecond, 10*time.Millisecond)}
+	c := newTestClient(t, b.handler(), append(base, opts...)...)
+	if patience > 0 {
+		c.cfg.replayPatience = patience
+	}
+	return c
+}
+
+// replayed records what a replay handed over, keyed by partition and
+// offset, so a test can tell a record seen twice from one seen once.
+type replayed struct {
+	mu   sync.Mutex
+	seen map[[2]int64]int
+}
+
+func (r *replayed) handler() Handler {
+	return HandlerFunc(func(_ context.Context, msg *Message) error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.seen == nil {
+			r.seen = map[[2]int64]int{}
+		}
+		r.seen[[2]int64{int64(msg.Partition), msg.Offset}]++
+		return nil
+	})
+}
+
+// exactlyOnce fails the test unless every record of b was handed over
+// once and nothing else was.
+func (r *replayed) exactlyOnce(t *testing.T, b *logBroker) {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	want := 0
+	for partition, offsets := range b.records {
+		for offset := range offsets {
+			want++
+			if got := r.seen[[2]int64{int64(partition), offset}]; got != 1 {
+				t.Errorf("partition %d offset %d handed over %d times, want 1", partition, offset, got)
+			}
+		}
+	}
+	if len(r.seen) != want {
+		t.Errorf("handed over %d distinct records, want %d: %v", len(r.seen), want, r.seen)
+	}
+}
+
+// A node that has applied a topic's creation but not yet its partition
+// assignments answers with the partition unassigned. That clears in a
+// moment, so a replay of a topic created just now waits for it rather
+// than fail.
+func TestReplayWaitsForANewTopicsPartitionsToBeAssigned(t *testing.T) {
+	t.Parallel()
+
+	b := &logBroker{
+		records: map[int]map[int64]string{0: {0: "a", 1: "b"}, 1: {0: "c"}, 2: {0: "d", 1: "e"}},
+		oldest:  map[int]int64{0: 0, 1: 0, 2: 0},
+	}
+	b.unavailable = func() map[int]string {
+		if b.lookups.Load() <= 2 {
+			return map[int]string{2: "unassigned"}
+		}
+		return nil
+	}
+	c := newReplayClient(t, b, 0)
+
+	var got replayed
+	if err := c.Replay(context.Background(), "orders", got.handler()); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	got.exactlyOnce(t, b)
+	if n := b.lookups.Load(); n != 3 {
+		t.Errorf("topic lookups = %d, want 3", n)
+	}
+}
+
+// A partition whose owner is down reports zero placeholders. Replaying
+// it from them would read nothing and look like an empty partition, so
+// the replay reads nothing at all, and once its patience runs out it
+// says which partition it could not read and why.
+func TestReplayGivesUpOnAPartitionThatStaysDown(t *testing.T) {
+	t.Parallel()
+
+	var reads, lookups atomic.Int32
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/consume") {
+			reads.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		lookups.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(partialTopicFixture))
+	}, WithBackoff(time.Millisecond, 10*time.Millisecond))
+	c.cfg.replayPatience = 200 * time.Millisecond
+
+	start := time.Now()
+	err := c.Replay(context.Background(), "orders", HandlerFunc(
+		func(context.Context, *Message) error { return nil }))
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), "partition 1 (owner dead)") {
+		t.Errorf("err = %v, want it to name the partition and why", err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("gave up after %s, want about its 200ms patience", took)
+	}
+	if reads.Load() != 0 {
+		t.Errorf("replay read %d records before giving up", reads.Load())
+	}
+	if n := lookups.Load(); n < 2 || n >= 200 {
+		t.Errorf("topic lookups = %d, want more than one and far fewer than one a millisecond", n)
+	}
+}
+
+// The context bounds the wait, whatever the patience left.
+func TestReplayStopsWaitingWhenTheContextEnds(t *testing.T) {
+	t.Parallel()
+
+	b := &logBroker{
+		records:     map[int]map[int64]string{0: {0: "a"}, 1: {0: "b"}},
+		oldest:      map[int]int64{0: 0, 1: 0},
+		unavailable: func() map[int]string { return map[int]string{1: "dead"} },
+	}
+	c := newReplayClient(t, b, 0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := c.Replay(ctx, "orders", HandlerFunc(func(context.Context, *Message) error { return nil }))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the context's deadline", err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("returned after %s, want soon after the 100ms deadline", took)
+	}
+}
+
+// A read that keeps failing for longer than one call's own retries
+// cover, such as while a partition moves to another owner, is waited
+// out, and the replay picks up at the offset that failed: nothing
+// already handed over comes round again.
+func TestReplayResumesAPartitionAfterATransientReadFailure(t *testing.T) {
+	t.Parallel()
+
+	var failures atomic.Int32
+	b := &logBroker{
+		records: map[int]map[int64]string{0: {0: "a", 1: "b"}, 1: {0: "c", 1: "d", 2: "e"}, 2: {0: "f"}},
+		oldest:  map[int]int64{0: 0, 1: 0, 2: 0},
+		fault: func(w http.ResponseWriter, partition int, offset int64) bool {
+			if partition == 1 && offset == 1 && failures.Add(1) <= 5 {
+				writeBrokerError(w, http.StatusServiceUnavailable, "partition owner unavailable")
+				return true
+			}
+			return false
+		},
+	}
+	c := newReplayClient(t, b, 0, WithRetries(2))
+
+	var got replayed
+	if err := c.Replay(context.Background(), "orders", got.handler()); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	got.exactlyOnce(t, b)
+}
+
+// A Retry-After longer than the patience left is not slept through:
+// the replay gives up at once rather than block past its own limit.
+func TestReplayNeverSleepsPastItsLimitOnRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	b := &logBroker{
+		records: map[int]map[int64]string{0: {0: "a"}},
+		oldest:  map[int]int64{0: 0},
+		fault: func(w http.ResponseWriter, _ int, _ int64) bool {
+			w.Header().Set("Retry-After", "5")
+			writeBrokerError(w, http.StatusServiceUnavailable, "shedding load")
+			return true
+		},
+	}
+	c := newReplayClient(t, b, 300*time.Millisecond, WithRetries(1))
+
+	start := time.Now()
+	err := c.Replay(context.Background(), "orders", HandlerFunc(func(context.Context, *Message) error { return nil }))
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("gave up after %s, want well before the 5s Retry-After", took)
+	}
+}
+
+// A Retry-After within the patience left is honoured: the next read
+// waits at least that long.
+func TestReplayHonoursRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var at []time.Time
+	b := &logBroker{
+		records: map[int]map[int64]string{0: {0: "a"}},
+		oldest:  map[int]int64{0: 0},
+	}
+	b.fault = func(w http.ResponseWriter, _ int, offset int64) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if offset != 0 {
+			return false
+		}
+		at = append(at, time.Now())
+		if len(at) == 1 {
+			w.Header().Set("Retry-After", "1")
+			writeBrokerError(w, http.StatusServiceUnavailable, "shedding load")
+			return true
+		}
+		return false
+	}
+	c := newReplayClient(t, b, 0, WithRetries(1))
+
+	var got replayed
+	if err := c.Replay(context.Background(), "orders", got.handler()); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	got.exactlyOnce(t, b)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(at) != 2 {
+		t.Fatalf("reads of offset 0 = %d, want 2", len(at))
+	}
+	if gap := at[1].Sub(at[0]); gap < time.Second {
+		t.Errorf("retried after %s, want at least the 1s Retry-After", gap)
+	}
+}
+
+// What waiting cannot change is reported at once: a topic that is not
+// there, a read that is forbidden, and the handler's own error.
+func TestReplayDoesNotRetryWhatWillNotChange(t *testing.T) {
+	t.Parallel()
+
+	t.Run("not found", func(t *testing.T) {
+		t.Parallel()
+		var lookups atomic.Int32
+		c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			lookups.Add(1)
+			writeBrokerError(w, http.StatusNotFound, "topic not found")
+		})
+		err := c.Replay(context.Background(), "orders", HandlerFunc(func(context.Context, *Message) error { return nil }))
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("err = %v, want ErrNotFound", err)
+		}
+		if n := lookups.Load(); n != 1 {
+			t.Errorf("topic lookups = %d, want 1", n)
+		}
+	})
+
+	t.Run("forbidden read", func(t *testing.T) {
+		t.Parallel()
+		b := &logBroker{
+			records: map[int]map[int64]string{0: {0: "a"}},
+			oldest:  map[int]int64{0: 0},
+			fault: func(w http.ResponseWriter, _ int, _ int64) bool {
+				writeBrokerError(w, http.StatusForbidden, "no grant")
+				return true
+			},
+		}
+		c := newReplayClient(t, b, 0)
+		err := c.Replay(context.Background(), "orders", HandlerFunc(func(context.Context, *Message) error { return nil }))
+		if !errors.Is(err, ErrForbidden) {
+			t.Fatalf("err = %v, want ErrForbidden", err)
+		}
+		if n := b.reads.Load(); n != 1 {
+			t.Errorf("reads = %d, want 1", n)
+		}
+	})
+
+	t.Run("handler error", func(t *testing.T) {
+		t.Parallel()
+		b := &logBroker{
+			records: map[int]map[int64]string{0: {0: "a", 1: "b"}},
+			oldest:  map[int]int64{0: 0},
+		}
+		c := newReplayClient(t, b, 0)
+		boom := errors.New("stop here")
+		var calls atomic.Int32
+		err := c.Replay(context.Background(), "orders", HandlerFunc(func(context.Context, *Message) error {
+			calls.Add(1)
+			return boom
+		}))
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want the handler's error", err)
+		}
+		if n := calls.Load(); n != 1 {
+			t.Errorf("handler calls = %d, want 1", n)
+		}
+	})
+}
+
+// ReadFrom makes no promise to wait: a read that fails past the call's
+// own retries is returned, as it always was.
+func TestReadFromKeepsItsOwnBehaviour(t *testing.T) {
+	t.Parallel()
+
+	b := &logBroker{
+		records: map[int]map[int64]string{0: {0: "a"}},
+		oldest:  map[int]int64{0: 0},
+		fault: func(w http.ResponseWriter, _ int, _ int64) bool {
+			writeBrokerError(w, http.StatusServiceUnavailable, "partition owner unavailable")
+			return true
+		},
+	}
+	c := newReplayClient(t, b, 0, WithRetries(2))
+
+	err := c.ReadFrom(context.Background(), "orders", 0, 0, HandlerFunc(func(context.Context, *Message) error { return nil }))
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if n := b.reads.Load(); n != 2 {
+		t.Errorf("reads = %d, want the 2 attempts of one call", n)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -11,7 +12,10 @@ import (
 // status codes or reading messages.
 var (
 	// ErrBadRequest means the server rejected the request as malformed.
-	// Sending it again unchanged will fail the same way.
+	// Sending it again unchanged will fail the same way. Among the
+	// reasons: a payload nested deeper than 256 levels on a topic with a
+	// schema, a new topic name over 200 bytes, an empty batch, and a
+	// produce to a delayed fan-out child, which only its parent feeds.
 	ErrBadRequest = errors.New("narad: bad request")
 
 	// ErrUnauthenticated means the credentials were missing or wrong.
@@ -28,8 +32,23 @@ var (
 	// ErrExists means the state you assumed is not the state that is
 	// there. Creating a topic that already exists reports it, which is
 	// why EnsureTopic treats it as success, and so does a conditional
-	// schema update whose base version is no longer current.
+	// schema update whose base version is no longer current. The two
+	// more specific conflicts below match it as well.
 	ErrExists = errors.New("narad: already exists")
+
+	// ErrNameTaken means a topic could not be created because one whose
+	// name differs only in letter case already exists. The two would
+	// share a directory on a case-insensitive filesystem, so the broker
+	// refuses the second. Choose another name. It also matches
+	// [ErrExists], though the topic you asked for does not exist.
+	ErrNameTaken = errors.New("narad: topic name taken in another letter case")
+
+	// ErrTopicChanged means the topic was changed underneath the
+	// request, twice, while the broker was applying it: deleted and
+	// recreated, or given more partitions. Read the topic again and
+	// decide whether the change still makes sense. It also matches
+	// [ErrExists].
+	ErrTopicChanged = errors.New("narad: topic changed since it was read")
 
 	// ErrLeaseLost means the message's visibility window closed before
 	// the ack arrived, or it was already acked and redelivered under a
@@ -52,12 +71,20 @@ var (
 	ErrTooLarge = errors.New("narad: message too large")
 
 	// ErrThrottled means the server is shedding load, or this identity
-	// has too many consumes in flight. Back off, or use fewer workers.
+	// has too many consumes or produces in flight, or too many failed
+	// logins have been seen lately. Back off, or use fewer workers.
 	ErrThrottled = errors.New("narad: throttled")
 
-	// ErrUnavailable means this node could not serve the request now,
-	// usually because a partition's owner is down. Another node, or the
-	// same one later, may do better.
+	// ErrUnavailable means this node could not serve the request now:
+	// a partition's owner is down, the node is being decommissioned, or
+	// its schema validator is busy. Another node, or the same one later,
+	// may do better, and the client tries another node by itself.
+	//
+	// The client raises it itself for a topic with a partition that
+	// cannot be read now, such as one whose owner is down or, on a topic
+	// created a moment ago, one the node answering has not seen assigned
+	// yet. [Client.Replay] waits for such a partition for a while before
+	// reporting it. [Retryable] is true for it either way.
 	ErrUnavailable = errors.New("narad: unavailable")
 
 	// ErrServer means the server failed internally.
@@ -127,7 +154,7 @@ func (e *ConnError) Error() string {
 	if e.Topic != "" {
 		where += " " + e.Topic
 	}
-	if e.reached {
+	if e.reached && !readOnly(e.Op) {
 		return fmt.Sprintf("narad: %s: %v (the server may have applied it)", where, e.Err)
 	}
 	return fmt.Sprintf("narad: %s: %v", where, e.Err)
@@ -143,6 +170,9 @@ func (e *ConnError) Unwrap() error { return e.Err }
 // also be uncertain, and for anything that changes state those two
 // together mean a retry may duplicate. Ask [Uncertain] as well when that
 // matters.
+//
+// [ErrUnavailable] is retryable whether a node sent it or the client
+// raised it itself, as it does for a partition that cannot be read now.
 func Retryable(err error) bool {
 	var apiErr *Error
 	if errors.As(err, &apiErr) {
@@ -162,7 +192,7 @@ func Retryable(err error) bool {
 	if errors.As(err, &connErr) {
 		return true
 	}
-	return errors.Is(err, ErrNoNodes)
+	return errors.Is(err, ErrNoNodes) || errors.Is(err, ErrUnavailable)
 }
 
 // Uncertain reports whether the server may have carried out the request
@@ -171,17 +201,33 @@ func Retryable(err error) bool {
 // This is the question that decides whether retrying can duplicate, and
 // the status alone cannot answer it. A 503 means opposite things
 // depending on the operation: on ack and consume the router declined
-// before anything could act, while a produce can get one from a control
-// plane that went away partway through. Getting that backwards would
-// make an ack that never happened look as though it did, which is the
-// one outcome the lease exists to prevent.
+// before anything could act, while a produce can get one from a proxy
+// that gave up after passing the request on. Getting that backwards
+// would make an ack that never happened look as though it did, which is
+// the one outcome the lease exists to prevent.
+//
+// A 503 on a topic write ([Client.CreateTopic], [Client.DeleteTopic],
+// [Client.SetSchema]) is uncertain too, as is any 503 whose message says
+// the change may still be applied: the leader may have taken the change
+// before the answer was lost. A resend can then meet its own change, so
+// a create that worked reports [ErrExists]. Read the topic back before
+// deciding.
+//
+// A read is never uncertain, however it failed: [Client.ReadAt],
+// [Client.ReadFrom], [Client.Replay], [Client.Topic], [Client.Topics]
+// and [Client.Ping] change nothing on the server, so there is nothing a
+// retry could duplicate. A consume is not a read in this sense, since
+// it takes a lease.
 func Uncertain(err error) bool {
 	var connErr *ConnError
 	if errors.As(err, &connErr) {
-		return connErr.reached
+		return connErr.reached && !readOnly(connErr.Op)
 	}
 	var apiErr *Error
 	if errors.As(err, &apiErr) {
+		if readOnly(apiErr.Op) {
+			return false
+		}
 		switch apiErr.Status {
 		case http.StatusInternalServerError:
 			// The server was already working on it.
@@ -191,11 +237,86 @@ func Uncertain(err error) bool {
 			// have acted on it.
 			return true
 		case http.StatusServiceUnavailable:
-			return apiErr.Op == opProduce
+			if strings.Contains(apiErr.Message, outcomeUnknown) {
+				// The leader appended the change and then lost its
+				// leadership; a later leader may still commit it.
+				return true
+			}
+			switch apiErr.Op {
+			case opProduce, opProduceBatch:
+				// The broker's own produce 503s store nothing, but the
+				// status alone cannot tell them from a proxy's, which
+				// may have passed the request on, so only the broker's
+				// messages make a produce 503 certain.
+				return !storedNothing(apiErr.Message)
+			case opCreateTopic, opDeleteTopic, opSetSchema:
+				// A follower forwards a topic write to the leader, and a
+				// forward that got no answer is a 503 whose text varies
+				// with the cause while the leader may have applied it.
+				return true
+			}
+			return false
 		}
 	}
 	return false
 }
+
+// readOnly reports whether an operation changes nothing on the server,
+// so that a failure of it can never have been applied.
+func readOnly(op string) bool {
+	switch op {
+	case opRead, opTopic, opTopics, opPing:
+		return true
+	}
+	return false
+}
+
+// outcomeUnknown is the text a 3.1.0 broker puts in a 503 for a write
+// whose outcome it does not know.
+const outcomeUnknown = "the change may still be applied"
+
+// storedNothing reports whether a produce 503's message is one the
+// broker sends before anything is written: a node being decommissioned,
+// or a schema validation that never ran for want of a slot. The texts
+// are the broker's, from its 3.1.0 release on, which is also the first
+// release that answers a produce with 503 at all. A batch produce may
+// prefix them with the message they are about.
+func storedNothing(message string) bool {
+	return strings.Contains(message, "being decommissioned and takes no new produce") ||
+		strings.Contains(message, "schema validation slot")
+}
+
+// errorKind is the sentinel for a reply, refined by the server's
+// message where one status covers conflicts a caller acts on
+// differently. The texts matched are the broker's, from its 3.1.0
+// release on.
+func errorKind(status int, message string) error {
+	kind := statusError(status)
+	if status != http.StatusConflict {
+		return kind
+	}
+	switch {
+	case strings.Contains(message, "differs only in letter case"):
+		return kinds{ErrNameTaken, ErrExists}
+	case strings.Contains(message, "topic changed since it was read"):
+		return kinds{ErrTopicChanged, ErrExists}
+	case strings.Contains(message, "delayed child topic is not allowed"):
+		// A delayed child is fed only by its parent. Nothing about the
+		// produce already exists, and sending it again will be refused
+		// the same way, so it must not read as the conflict EnsureTopic
+		// takes for success.
+		return ErrBadRequest
+	}
+	return kind
+}
+
+// kinds lets one reply match more than one sentinel, so a refinement
+// such as ErrNameTaken does not stop errors.Is(err, ErrExists) from
+// finding what it always found.
+type kinds []error
+
+func (k kinds) Error() string   { return k[0].Error() }
+func (k kinds) Unwrap() []error { return k }
 
 // statusError maps a status to its sentinel.
 func statusError(status int) error {

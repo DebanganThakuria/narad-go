@@ -131,6 +131,22 @@ func (n *node) observe(err error) {
 	n.fail(err)
 }
 
+// abandon records a request whose caller stopped waiting: no answer
+// about the node, so its breaker keeps its state. A half-open probe is
+// handed back, so the next request may ask the question instead of the
+// node waiting for an answer that will never come.
+func (n *node) abandon() {
+	if n.failAfter <= 0 {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.state == halfOpen {
+		n.openedAt = n.now().Add(-n.openFor)
+		n.setState(open)
+	}
+}
+
 func (n *node) succeed() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -187,9 +203,11 @@ func (n *node) snapshot() NodeHealth {
 // Getting this wrong costs in both directions. Counting a 404 would let
 // one caller asking for a missing topic take every node out of rotation.
 // Not counting a 503 would leave a client hammering a node whose
-// partitions are all unavailable. A 429 is excluded because Narad's is a
-// per-identity cap on consumes in flight: every node answers the same
-// way, so the fix is fewer workers, not a different node.
+// partitions are all unavailable, or one being decommissioned, which
+// refuses every produce until it is gone. A 429 is excluded because
+// Narad's are per identity (consumes or produces in flight) or guard
+// logins: every node answers the same way, so the fix is fewer workers,
+// not a different node.
 func nodeFault(err error) bool {
 	if err == nil {
 		return false
@@ -266,6 +284,17 @@ func (s *nodeSet) pick(tried map[string]bool) *node {
 		}
 	}
 	return nil
+}
+
+// untried reports whether a ready node remains that this call has not
+// tried yet.
+func (s *nodeSet) untried(tried map[string]bool) bool {
+	for _, candidate := range s.all {
+		if !tried[candidate.address] && candidate.ready() {
+			return true
+		}
+	}
+	return false
 }
 
 // find returns the node with this address, or nil.

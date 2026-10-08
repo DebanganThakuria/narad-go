@@ -13,7 +13,9 @@ commit. Underneath, a topic is a partitioned append-only log with offsets
 and retention, which is what pays for replay, cheap fan-out, and messages
 that survive being consumed.
 
-Its one dependency is the Prometheus client, for the built-in metrics.
+It depends on nothing beyond the standard library. The Prometheus metrics
+live in a module of their own, so only programs that use them pull the
+Prometheus client in.
 
 ## The whole of it
 
@@ -68,6 +70,7 @@ client, err := narad.New("n1:7942,n2:7942,n3:7942",
 
 err = client.Consume(ctx, "orders", handler,
     narad.WithWorkers(16),
+    narad.WithBatch(50),
     narad.WithWait(10*time.Second),
     narad.WithErrorHandler(func(msg *narad.Message, err error) { ... }),
 )
@@ -76,6 +79,41 @@ err = client.Consume(ctx, "orders", handler,
 Give it every node you have, comma separated. The client spreads work
 across them and routes around the ones that are failing, which is what
 makes a node restart invisible to your code.
+
+## Batches
+
+When many messages go at once, a batch stores up to 100 of them in one
+request, all or none:
+
+```go
+var batch narad.Batch
+for _, order := range orders {
+    if err := batch.Add(order, narad.WithKey(order.Customer)); err != nil {
+        return err // narad.ErrBatchFull past 100 messages or 1 MiB
+    }
+}
+err := client.ProduceBatch(ctx, "orders", &batch)
+```
+
+`Add` takes what `Produce` takes, per message. If the broker refuses one
+message, nothing is stored and the error names it (`message 3: ...`).
+A lost reply is uncertain for the whole batch, exactly as for one
+produce, and envelope ids are fixed when a message is added, so a batch
+sent again carries the same ids.
+
+On the consuming side, `WithBatch(n)` has each worker take up to `n`
+messages per request and ack its successes together. The handler does
+not change: it still sees one message at a time, the batch's leases are
+renewed together in one request per round while their messages wait, a
+failure is handed back at once, and each message's ack outcome is
+reported on its own, a lost lease included. On shutdown the messages
+already handled are acked at once and the ones not yet started are
+handed back at once. A message the client cannot decode costs only
+itself: it is reported and left to lapse, and the rest of its batch is
+handled.
+
+Both need Narad 3.1.0. An older broker answers `ProduceBatch` with
+`ErrNotFound`; a consumer with `WithBatch` falls back to one at a time.
 
 ## Envelopes
 
@@ -136,12 +174,23 @@ errors.Is(err, narad.ErrNotFound) // which assumption was wrong
 ```
 
 `ErrBadRequest`, `ErrUnauthenticated`, `ErrForbidden`, `ErrNotFound`,
-`ErrExists`, `ErrLeaseLost`, `ErrNoLease`, `ErrOffsetGone`,
-`ErrTooLarge`, `ErrThrottled`, `ErrUnavailable`, `ErrServer`,
-`ErrNoNodes`, `ErrClosed`, `ErrNoEnvelope`.
+`ErrExists`, `ErrNameTaken`, `ErrTopicChanged`, `ErrLeaseLost`,
+`ErrNoLease`, `ErrOffsetGone`, `ErrTooLarge`, `ErrBatchFull`,
+`ErrThrottled`, `ErrUnavailable`, `ErrServer`, `ErrNoNodes`,
+`ErrClosed`, `ErrNoEnvelope`.
+
+`ErrNameTaken` (a topic name that differs from an existing one only in
+letter case) and `ErrTopicChanged` (the topic changed under the request)
+also match `ErrExists`.
 
 `*narad.Error` carries the status, the server's message and the node that
 answered. `*narad.ConnError` covers requests that never got a reply.
+
+A read (`ReadAt`, `ReadFrom`, `Replay`, `Topic`, `Topics`, `Ping`)
+changes nothing, so it is never uncertain however it failed, and
+`WithCautiousRetries()` still retries it. `ErrUnavailable` is retryable
+whether a node sent it or the client raised it for a partition that
+cannot be read now.
 
 ## At-least-once, and what it asks of you
 
@@ -155,6 +204,13 @@ still be committed, so retrying it can duplicate. The client retries by
 default, because a duplicate is recoverable and a lost message is not.
 When a duplicate is the worse outcome, `WithCautiousRetries()` hands the
 choice back and `Uncertain(err)` tells you when it matters.
+
+A node that refuses a produce outright (one being decommissioned, or
+whose schema validator is busy) answers 503 and stores nothing; the
+client moves to another node without waiting, with `WithCautiousRetries()`
+too. It tells those 503s apart by the broker's message. Any other produce
+503, such as a proxy's, may have stored the message, so it counts as
+uncertain and `WithCautiousRetries()` stops at it.
 
 ## Logging
 
@@ -171,11 +227,28 @@ anything finer, use `WithEvents`.
 
 ## Metrics
 
-Prometheus metrics are built in. Register them and hand `Observe` to the
-client:
+Prometheus metrics come in a separate module, so the client itself stays
+free of dependencies:
+
+```sh
+go get github.com/debanganthakuria/narad-go/prometheus
+```
+
+It is tagged on its own, as `prometheus/vX.Y.Z`, and names the oldest
+client release it works with; `go get` raises your client to that
+release if yours is older.
+
+Its package is named `prometheus` too, so import it under an alias.
+Register the metrics and hand `Observe` to the client:
 
 ```go
-metrics := narad.NewMetrics(prometheus.DefaultRegisterer)
+import (
+    "github.com/debanganthakuria/narad-go"
+    naradprom "github.com/debanganthakuria/narad-go/prometheus"
+    "github.com/prometheus/client_golang/prometheus"
+)
+
+metrics := naradprom.NewMetrics(prometheus.DefaultRegisterer)
 client, err := narad.New(addr, narad.WithEvents(metrics.Observe))
 ```
 
@@ -186,7 +259,7 @@ Give it a prefix to scope the metrics to your service, or to tell two
 clients in one process apart on a registry that refuses duplicate names:
 
 ```go
-metrics := narad.NewMetrics(reg, narad.WithMetricsPrefix("payments"))
+metrics := naradprom.NewMetrics(reg, naradprom.WithMetricsPrefix("payments"))
 // payments_narad_requests_total, and so on
 ```
 
@@ -197,7 +270,20 @@ for `narad.Event`, which reports anywhere you like.
 ## Also here
 
 Topics (`CreateTopic`, `EnsureTopic`, `Topic`, `Topics`, `DeleteTopic`,
-`SetSchema`), replay (`ReadAt`), and health (`Ping`, `Health`).
+`SetSchema`), replay (`ReadAt`, `ReadFrom`, `Replay`), and health
+(`Ping`, `Health`).
+
+`WithRetention(d)` sets an age; leaving it out gives the operator's
+default, and `WithRetentionForever()` keeps records forever (a topic's
+`Retention` of zero reads the same way). While a partition's owner is
+down, `Topic` still answers, with `Partial` set and that partition's
+stats marked unavailable (`PartitionStats.Available`). `Replay` never
+skips a partition it cannot read: it waits for it (with jittered backoff,
+honouring Retry-After, for at most 30 seconds of continuous failure per
+partition and never past your ctx), then reports `ErrUnavailable` naming
+the partitions. The same wait covers a topic created a moment ago, whose
+partitions a node may not have seen assigned yet, and a read that fails
+in transit, which resumes where it failed. `ReadFrom` does not wait.
 
 `Ping` takes the node to probe, because a probe sent through the client's
 own load balancing would answer for whichever node came next. It does not
@@ -214,10 +300,19 @@ string you really sent. `msg.Bytes()` unquotes it, which is right for the
 first and loses the quotes on the second. Send a struct and read it with
 `msg.Into` and the question never comes up.
 
+Keys do not have this problem. A key can be any bytes, and `msg.Key`
+holds exactly the bytes it was produced with: the broker sends a key that
+is not valid UTF-8 as base64 with a flag, and the client decodes it.
+`Key` is a string because `WithKey` takes one, so use `[]byte(msg.Key)`
+when the bytes matter. A message produced without a key has an empty
+`Key`; from Narad 3.1.0 on the broker no longer invents one for it.
+
 ## Compatibility
 
 Go 1.23 or later. Narad's `/v1` HTTP surface is stable, so a client built
-against it keeps working across broker upgrades.
+against it keeps working across broker upgrades. Batches, keep-forever
+retention and partial topic answers need Narad 3.1.0; everything else
+works against earlier releases too.
 
 ## License
 

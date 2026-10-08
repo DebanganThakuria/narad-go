@@ -142,6 +142,148 @@ func TestIntegration(t *testing.T) {
 			if stats.Owner == "" {
 				t.Errorf("partition %d has no owner node", stats.Index)
 			}
+			if !stats.Available() {
+				t.Errorf("partition %d is unavailable (%s) on a healthy cluster", stats.Index, stats.OwnerLiveness)
+			}
+		}
+		if described.Partial {
+			t.Error("a healthy cluster described the topic as partial")
+		}
+	})
+
+	t.Run("topic names and retention", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		forever := makeTopic(t, client, prefix+"-forever",
+			narad.WithPartitionCount(MinPartitions), narad.WithRetentionForever())
+		if forever.Retention != 0 {
+			t.Errorf("retention = %s, want 0, which is kept forever", forever.Retention)
+		}
+
+		// A name that differs only in letter case would share a
+		// directory on a case-insensitive filesystem.
+		lower := prefix + "-case"
+		makeTopic(t, client, lower, narad.WithPartitionCount(MinPartitions))
+		upper := strings.ToUpper(lower)
+		if _, err := client.CreateTopic(ctx, upper, narad.WithPartitionCount(MinPartitions)); !errors.Is(err, narad.ErrNameTaken) {
+			t.Errorf("CreateTopic %s = %v, want ErrNameTaken", upper, err)
+			_ = client.DeleteTopic(ctx, upper)
+		}
+		if _, err := client.EnsureTopic(ctx, upper, narad.WithPartitionCount(MinPartitions)); !errors.Is(err, narad.ErrNameTaken) {
+			t.Errorf("EnsureTopic %s = %v, want ErrNameTaken", upper, err)
+		}
+
+		long := prefix + "-" + strings.Repeat("x", 201)
+		if _, err := client.CreateTopic(ctx, long); !errors.Is(err, narad.ErrBadRequest) {
+			t.Errorf("a %d-byte name = %v, want ErrBadRequest", len(long), err)
+			_ = client.DeleteTopic(ctx, long)
+		}
+	})
+
+	t.Run("batch produce and batch consume", func(t *testing.T) {
+		name := prefix + "-batch"
+		makeTopic(t, client, name, narad.WithPartitionCount(MinPartitions), narad.WithVisibilityTimeout(30*time.Second))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+
+		const count = 30
+		keys := map[string]string{} // payment id to the key it was produced with
+		var batch narad.Batch
+		for i := range count {
+			p := payment{ID: fmt.Sprintf("pay_b%02d", i), Amount: int64(i)}
+			var opts []narad.ProduceOption
+			switch i % 3 {
+			case 0:
+				keys[p.ID] = fmt.Sprintf("customer-%d", i%4)
+			case 1:
+				keys[p.ID] = string([]byte{0x00, byte(i), 0x83, 0xff})
+			default:
+				keys[p.ID] = "" // keyless: the broker sends no key
+			}
+			if keys[p.ID] != "" {
+				opts = append(opts, narad.WithKey(keys[p.ID]))
+			}
+			if err := batch.Add(p, opts...); err != nil {
+				t.Fatalf("Add %d: %v", i, err)
+			}
+		}
+		if err := client.ProduceBatch(ctx, name, &batch); err != nil {
+			t.Fatalf("ProduceBatch: %v", err)
+		}
+
+		seen := newSeenSet(count)
+		var wrongKeys, consumeErrors atomic.Int32
+		consumeCtx, stopConsume := context.WithCancel(ctx)
+		defer stopConsume()
+		go func() {
+			_ = client.Consume(consumeCtx, name, narad.HandlerFunc(
+				func(_ context.Context, msg *narad.Message) error {
+					var got payment
+					if err := msg.Into(&got); err != nil {
+						return err
+					}
+					// Counted, not reported here: this goroutine can outlive
+					// the subtest, and t must not be used after it ends.
+					if msg.Key != keys[got.ID] {
+						wrongKeys.Add(1)
+					}
+					seen.add(got.ID)
+					return nil
+				}), narad.WithBatch(10), narad.WithWorkers(2), narad.WithWait(5*time.Second),
+				// A batch ack the broker refused, or any handle in it, is
+				// reported here; none should be.
+				narad.WithErrorHandler(func(*narad.Message, error) { consumeErrors.Add(1) }))
+		}()
+
+		select {
+		case <-seen.done:
+		case <-ctx.Done():
+			t.Fatalf("consumed %d distinct messages of %d", seen.count(), count)
+		}
+		stopConsume()
+		if wrongKeys.Load() != 0 {
+			t.Errorf("%d messages came back with a key other than the one produced", wrongKeys.Load())
+		}
+		// Give the last batch ack time to land before reading the count.
+		time.Sleep(500 * time.Millisecond)
+		if consumeErrors.Load() != 0 {
+			t.Errorf("the consumer reported %d errors", consumeErrors.Load())
+		}
+	})
+
+	t.Run("batch produce is all or none", func(t *testing.T) {
+		name := prefix + "-batch-schema"
+		makeTopic(t, client, name, narad.WithPartitionCount(MinPartitions), narad.WithSchema(json.RawMessage(`{
+			"type": "object",
+			"properties": {"id": {"type": "string"}, "amount": {"type": "integer"}},
+			"required": ["id", "amount"]
+		}`)))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		var batch narad.Batch
+		_ = batch.Add(payment{ID: "pay_ok", Amount: 1})
+		_ = batch.Add(map[string]any{"id": "pay_bad", "amount": "lots"})
+		err := client.ProduceBatch(ctx, name, &batch)
+		if !errors.Is(err, narad.ErrBadRequest) {
+			t.Fatalf("ProduceBatch with a bad message = %v, want ErrBadRequest", err)
+		}
+		var apiErr *narad.Error
+		if !errors.As(err, &apiErr) || !strings.HasPrefix(apiErr.Message, "message 1: ") {
+			t.Errorf("error = %v, want it to name message 1", err)
+		}
+
+		// Nothing was stored, the valid message included.
+		var stored int
+		if err := client.Replay(ctx, name, narad.HandlerFunc(
+			func(context.Context, *narad.Message) error { stored++; return nil })); err != nil {
+			t.Fatalf("Replay: %v", err)
+		}
+		if stored != 0 {
+			t.Errorf("stored %d messages of a refused batch, want none", stored)
 		}
 	})
 
@@ -277,8 +419,12 @@ func TestIntegration(t *testing.T) {
 		if retried.ID != original.ID {
 			t.Errorf("id changed across the retry: %q then %q", original.ID, retried.ID)
 		}
-		if second.Offset <= first.Offset {
-			t.Errorf("the retry is at offset %d, want past the original's %d", second.Offset, first.Offset)
+		// The retry is a new record. A keyless message has no key from
+		// Narad 3.1.0 on, so its copy is placed round-robin and may land
+		// on another partition; on the same one it must come later.
+		if second.Partition == first.Partition && second.Offset <= first.Offset {
+			t.Errorf("the retry is at %d@%d, want a new record after the original's %d@%d",
+				second.Partition, second.Offset, first.Partition, first.Offset)
 		}
 		if err := second.Ack(ctx); err != nil {
 			t.Errorf("Ack: %v", err)
@@ -413,32 +559,28 @@ func TestIntegration(t *testing.T) {
 		// earlier ones: each subtest's t.Cleanup deletes its topics when
 		// that subtest ends, so by now they are gone. A first version of
 		// this test looked for them and failed for that reason alone.
-		name := prefix + "-listed"
-		makeTopic(t, client, name, narad.WithPartitionCount(MinPartitions))
+		names := []string{prefix + "-listed-a", prefix + "-listed-b"}
+		for _, name := range names {
+			makeTopic(t, client, name, narad.WithPartitionCount(MinPartitions))
+		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
+		// On a shared cluster this also follows the pagination to the
+		// end; a fresh local node may hold only these two.
 		topics, err := client.Topics(ctx)
 		if err != nil {
 			t.Fatalf("Topics: %v", err)
 		}
-		// A shared cluster has plenty of topics, so this also exercises
-		// following the pagination to the end.
-		if len(topics) < 2 {
-			t.Errorf("listed %d topics, expected a shared cluster to hold more", len(topics))
-		}
-		var found bool
+		listed := map[string]bool{}
 		for _, topic := range topics {
-			if topic.Name == name {
-				found = true
+			listed[topic.Name] = true
+		}
+		for _, name := range names {
+			if !listed[name] {
+				t.Errorf("%s was created but did not appear in the listing of %d topics", name, len(topics))
 			}
-		}
-		if !found {
-			t.Errorf("%s was created but did not appear in the listing of %d topics", name, len(topics))
-		}
-		if strings.TrimSpace(name) == "" {
-			t.Fatal("unreachable")
 		}
 	})
 }

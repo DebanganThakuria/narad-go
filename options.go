@@ -24,6 +24,9 @@ type config struct {
 	onEvent      func(Event)
 	log          Logger
 	http         *http.Client
+	// replayPatience bounds how long Replay keeps retrying one partition
+	// that cannot be read, counted over consecutive failures.
+	replayPatience time.Duration
 }
 
 // defaults are chosen so that a client created with no options is the
@@ -36,10 +39,11 @@ func defaults() config {
 			base: 50 * time.Millisecond,
 			max:  5 * time.Second,
 		},
-		breakAfter:   5,
-		breakFor:     2 * time.Second,
-		maxIdleConns: 64,
-		userAgent:    userAgent,
+		breakAfter:     5,
+		breakFor:       2 * time.Second,
+		maxIdleConns:   64,
+		userAgent:      userAgent,
+		replayPatience: 30 * time.Second,
 	}
 }
 
@@ -88,7 +92,8 @@ func WithBackoff(first, max time.Duration) Option {
 // default retries, because consumers have to tolerate duplicates under
 // at-least-once anyway and a lost message is not recoverable. Choose
 // this when a duplicate is the worse outcome, and reconcile yourself:
-// [Uncertain] reports exactly this case.
+// [Uncertain] reports exactly this case. It covers topic writes too,
+// whose resend can report a conflict with the change it made itself.
 func WithCautiousRetries() Option {
 	return func(c *config) { c.cautious = true }
 }
@@ -145,8 +150,9 @@ func WithHTTPClient(hc *http.Client) Option {
 	return func(c *config) { c.http = hc }
 }
 
-// WithEvents installs a callback for metrics and logging. [Metrics.Observe]
-// is the ready-made one for Prometheus.
+// WithEvents installs a callback for metrics and logging. Metrics.Observe
+// in the github.com/debanganthakuria/narad-go/prometheus module is the
+// ready-made one for Prometheus.
 //
 // It runs on the calling goroutine, so keep it cheap and do not call
 // back into the client from it.

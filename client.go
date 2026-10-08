@@ -23,12 +23,19 @@ const MaxMessageBytes = 1 << 20
 
 // Operation names, used in errors and in the event stream.
 const (
-	opProduce = "produce"
-	opConsume = "consume"
-	opRead    = "read"
-	opAck     = "ack"
-	opNack    = "nack"
-	opExtend  = "extend"
+	opProduce      = "produce"
+	opProduceBatch = "produce batch"
+	opConsume      = "consume"
+	opRead         = "read"
+	opAck          = "ack"
+	opNack         = "nack"
+	opExtend       = "extend"
+	opCreateTopic  = "create topic"
+	opDeleteTopic  = "delete topic"
+	opSetSchema    = "set schema"
+	opTopic        = "topic"
+	opTopics       = "topics"
+	opPing         = "ping"
 )
 
 const (
@@ -220,7 +227,15 @@ func (c *Client) do(ctx context.Context, rc call) (*reply, error) {
 		tried[node.address] = true
 
 		res, err := c.attempt(ctx, node, rc, attempt)
-		node.observe(err)
+		if err != nil && ctx.Err() != nil {
+			// The caller stopped waiting (its context ended), which says
+			// nothing about the node. Stopping a Consume cancels every
+			// long-poll it has in flight; counting those would open
+			// every breaker and fail the caller's next call.
+			node.abandon()
+		} else {
+			node.observe(err)
+		}
 		if err == nil {
 			return res, nil
 		}
@@ -240,6 +255,13 @@ func (c *Client) do(ctx context.Context, rc call) (*reply, error) {
 		}
 
 		delay := c.delay(err, attempt)
+		if movesOn(err) && c.nodes.untried(tried) {
+			// The node said it cannot serve this, not that the cluster
+			// is overloaded: a node being decommissioned answers every
+			// produce with 503 and Retry-After: 1. Its Retry-After is
+			// about itself, so the next node need not wait it out.
+			delay = c.cfg.backoff.delay(attempt)
+		}
 		c.emit(Event{
 			Kind: EventRetry, Op: rc.op, Topic: rc.topic, Node: node.address,
 			Attempt: attempt, Wait: delay, Err: err, Uncertain: Uncertain(err),
@@ -262,6 +284,17 @@ func (c *Client) delay(err error, attempt int) time.Duration {
 		return apiErr.RetryAfter
 	}
 	return c.cfg.backoff.delay(attempt)
+}
+
+// movesOn reports whether a failure is about the node that answered
+// rather than the cluster, so trying another node is the fix.
+//
+// An uncertain 503 is not: the change it was about may still be applied
+// wherever it went, and the wait the server asked for gives it the time
+// to settle before the retry.
+func movesOn(err error) bool {
+	var apiErr *Error
+	return errors.As(err, &apiErr) && apiErr.Status == http.StatusServiceUnavailable && !Uncertain(err)
 }
 
 // attempt performs one HTTP request.
@@ -366,23 +399,28 @@ func (c *Client) readError(rc call, node string, res *http.Response) *Error {
 		Status:     res.StatusCode,
 		Node:       node,
 		RetryAfter: retryAfter(res.Header.Get("Retry-After")),
-		kind:       statusError(res.StatusCode),
+		Message:    errorMessage(res.Body),
 	}
-	body, err := io.ReadAll(io.LimitReader(res.Body, maxErrorBody))
-	if err != nil || len(body) == 0 {
-		return apiErr
+	apiErr.kind = errorKind(apiErr.Status, apiErr.Message)
+	return apiErr
+}
+
+// errorMessage reads the server's explanation from a failed reply.
+//
+// Most errors are {"error":"..."}, but the cluster routing layer
+// answers some with plain text, so the body is kept either way.
+func errorMessage(body io.Reader) string {
+	raw, err := io.ReadAll(io.LimitReader(body, maxErrorBody))
+	if err != nil || len(raw) == 0 {
+		return ""
 	}
-	// Most errors are {"error":"..."}, but the cluster routing layer
-	// answers some with plain text, so the body is kept either way.
 	var wrapper struct {
 		Error string `json:"error"`
 	}
-	if json.Unmarshal(body, &wrapper) == nil && wrapper.Error != "" {
-		apiErr.Message = wrapper.Error
-		return apiErr
+	if json.Unmarshal(raw, &wrapper) == nil && wrapper.Error != "" {
+		return wrapper.Error
 	}
-	apiErr.Message = strings.TrimSpace(string(body))
-	return apiErr
+	return strings.TrimSpace(string(raw))
 }
 
 // emit delivers an event, if anyone asked for them.
@@ -498,7 +536,7 @@ func (c *Client) Ping(ctx context.Context, address string) error {
 	_, err = c.attempt(ctx, target, call{
 		method: http.MethodGet,
 		path:   "/readyz",
-		op:     "ping",
+		op:     opPing,
 		ok:     []int{http.StatusOK},
 	}, 0)
 	return err

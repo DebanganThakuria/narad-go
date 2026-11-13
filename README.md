@@ -4,318 +4,116 @@
 [![CI](https://github.com/DebanganThakuria/narad-go/actions/workflows/ci.yaml/badge.svg)](https://github.com/DebanganThakuria/narad-go/actions/workflows/ci.yaml)
 [![Release](https://img.shields.io/github/v/release/DebanganThakuria/narad-go?sort=semver)](https://github.com/DebanganThakuria/narad-go/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](./LICENSE)
-[![Go Version](https://img.shields.io/github/go-mod/go-version/DebanganThakuria/narad-go)](./go.mod)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/DebanganThakuria/narad-go/badge)](https://scorecard.dev/viewer/?uri=github.com/DebanganThakuria/narad-go)
 
-The Go client for [Narad](https://github.com/DebanganThakuria/narad).
+The Go client for [Narad](https://github.com/DebanganThakuria/narad), a
+queue-first message broker. You write against a work queue (take a message,
+hold it under a lease, ack it or let it come back); underneath, each topic is
+a partitioned log, which is what makes replay and fan-out cheap.
 
 ```sh
 go get github.com/debanganthakuria/narad-go@latest
 ```
 
-**The front door is SQS; the inside is Kafka.** You write against a work
-queue: take a message, hold it under a visibility timeout, ack it or let
-it come back. No consumer groups, no partition assignment, no offsets to
-commit. Underneath, a topic is a partitioned append-only log with offsets
-and retention, which is what pays for replay, cheap fan-out, and messages
-that survive being consumed.
+Needs Go 1.26 or later. The core `narad` package imports only the standard
+library.
 
-The core `narad` package imports nothing beyond the standard library. The
-Prometheus metrics live in their own package, so only programs that import
-it compile the Prometheus client.
-
-## The whole of it
+## Quick start
 
 ```go
-client, err := narad.New("localhost:7942")
+client, err := narad.New("n1:7942,n2:7942,n3:7942",
+    narad.WithAuth("svc", os.Getenv("NARAD_PASSWORD")))
 if err != nil {
     return err
 }
 defer client.Close()
 
-// Produce. A struct becomes JSON, []byte and string go as they are.
+// A struct becomes JSON; []byte and string go as they are.
 err = client.Produce(ctx, "orders", order)
 
-// Consume. Long-polls, runs a worker pool, manages the lease, acks.
+// Long-polls, keeps the lease alive while the handler runs,
+// acks on success and hands the message back on error.
 err = client.Consume(ctx, "orders", narad.HandlerFunc(
     func(ctx context.Context, msg *narad.Message) error {
-        var order Order
-        if err := msg.Into(&order); err != nil {
+        var o Order
+        if err := msg.Into(&o); err != nil {
             return err
         }
-        return process(ctx, order)
+        return process(ctx, o)
     }))
 ```
 
-That is the API. Everything below is optional.
+List every node, comma separated: the client spreads requests across them
+and routes around failing ones, so a node restart is invisible to your code.
 
-## Defaults you do not have to think about
+## What you get without configuring anything
 
-| | |
-|---|---|
-| Long polling | An idle consumer waits on the broker instead of spinning |
-| Lease renewal | Slow work keeps its message instead of losing it mid-handler |
-| Lease-loss cancellation | If the lease is lost, the handler's context is cancelled, because somebody else may have the message now |
-| Ack on success, hand back on failure | A handler error returns the message at once rather than waiting out the timeout |
-| Panic recovery | One bad message does not take the consumer down |
-| Graceful shutdown | In-flight handlers get 30s to finish and ack |
-| Retries with full jitter | Four attempts, spread so a struggling broker is not hit by every client at once |
-| Per-node circuit breakers | One dead node costs you that node, not the cluster |
-| Connection pooling | Sized for long polling, where Go's default of two idle connections per host is far too few |
+- Long polling, lease renewal for slow handlers, and handler cancellation if
+  the lease is lost.
+- Ack on success, immediate hand-back on error, panic recovery, and a
+  30-second graceful shutdown.
+- Retries with full jitter, per-node circuit breakers, and a connection pool
+  sized for long polling.
 
-## Options, when you need them
+Tune any of it with options such as `WithWorkers`, `WithTimeout`,
+`WithRetries` and `WithBreaker`; every option is documented on
+[pkg.go.dev](https://pkg.go.dev/github.com/debanganthakuria/narad-go).
 
-```go
-client, err := narad.New("n1:7942,n2:7942,n3:7942",
-    narad.WithAuth("svc", os.Getenv("NARAD_PASSWORD")),
-    narad.WithLogger(slog.Default()),
-    narad.WithTimeout(10*time.Second),
-    narad.WithRetries(5),
-    narad.WithBackoff(50*time.Millisecond, 5*time.Second),
-    narad.WithBreaker(5, 2*time.Second),
-)
+## Handlers must be idempotent
 
-err = client.Consume(ctx, "orders", handler,
-    narad.WithWorkers(16),
-    narad.WithBatch(50),
-    narad.WithWait(10*time.Second),
-    narad.WithErrorHandler(func(msg *narad.Message, err error) { ... }),
-)
-```
-
-Give it every node you have, comma separated. The client spreads work
-across them and routes around the ones that are failing, which is what
-makes a node restart invisible to your code.
-
-## Batches
-
-When many messages go at once, a batch stores up to 100 of them in one
-request, all or none:
-
-```go
-var batch narad.Batch
-for _, order := range orders {
-    if err := batch.Add(order, narad.WithKey(order.Customer)); err != nil {
-        return err // narad.ErrBatchFull past 100 messages or 1 MiB
-    }
-}
-err := client.ProduceBatch(ctx, "orders", &batch)
-```
-
-`Add` takes what `Produce` takes, per message. If the broker refuses one
-message, nothing is stored and the error names it (`message 3: ...`).
-A lost reply is uncertain for the whole batch, exactly as for one
-produce, and envelope ids are fixed when a message is added, so a batch
-sent again carries the same ids.
-
-On the consuming side, `WithBatch(n)` has each worker take up to `n`
-messages per request and ack its successes together. The handler does
-not change: it still sees one message at a time, the batch's leases are
-renewed together in one request per round while their messages wait, a
-failure is handed back at once, and each message's ack outcome is
-reported on its own, a lost lease included. On shutdown the messages
-already handled are acked at once and the ones not yet started are
-handed back at once. A message the client cannot decode costs only
-itself: it is reported and left to lapse, and the rest of its batch is
-handled.
-
-Both need Narad 3.1.0. An older broker answers `ProduceBatch` with
-`ErrNotFound`; a consumer with `WithBatch` falls back to one at a time.
-
-## Envelopes
-
-Publish plainly, or wrap the message so it carries an id, a timestamp,
-an attempt count and the last error:
-
-```go
-err := client.Produce(ctx, "orders", order,
-    narad.WithEnvelope(),
-    narad.WithHeaders(map[string]string{"trace": traceID}),
-)
-```
-
-The id is a UUIDv7, so ids sort in the order they were created, and it
-appears in every error and log line about that message. `msg.Into(&v)`
-unwraps for you; `msg.Envelope()` gives you the rest.
-
-**Attempts advance only when you republish.** The broker never rewrites a
-stored payload, so ordinary redelivery hands back the same bytes and the
-same count. `client.Retry` is what moves it: it publishes a fresh copy
-with the count raised and the error recorded, then acks the original.
-Point it at a delay child and you have backoff; point it at another topic
-and you have a parking queue.
-
-```go
-if env.Attempts >= 5 {
-    return client.Retry(ctx, msg, err, "orders-parked")
-}
-return client.Retry(ctx, msg, err, "orders-retry-30s")
-```
-
-### Envelopes and schemas together
-
-A topic schema describes your message, and an envelope is a different
-shape, so producing one to such a topic is rejected. `WithEnvelopeSchema`
-fixes that by wrapping your schema in the envelope's, so the broker
-validates both:
-
-```go
-_, err := client.EnsureTopic(ctx, "orders",
-    narad.WithPartitionCount(6),
-    narad.WithEnvelopeSchema(schema),
-)
-```
-
-Your `$defs` are lifted to the top of the result so internal `$ref`s keep
-resolving. `EnvelopeSchema` returns what will be stored, if you want to
-look.
-
-## Errors
-
-Three questions, answered without matching on strings:
+Narad delivers at least once and does not deduplicate, so a message can
+arrive more than once; it does not guarantee order either. A produce whose
+reply was lost may also have been stored; the client retries it by default,
+because a duplicate is recoverable and a lost message is not. Use
+`WithCautiousRetries()` when a duplicate is the worse outcome, and check
+errors without matching strings:
 
 ```go
 narad.Retryable(err)              // worth trying again
-narad.Uncertain(err)              // might have happened anyway
+narad.Uncertain(err)              // may have happened anyway
 errors.Is(err, narad.ErrNotFound) // which assumption was wrong
 ```
 
-`ErrBadRequest`, `ErrUnauthenticated`, `ErrForbidden`, `ErrNotFound`,
-`ErrExists`, `ErrNameTaken`, `ErrTopicChanged`, `ErrLeaseLost`,
-`ErrNoLease`, `ErrOffsetGone`, `ErrTooLarge`, `ErrBatchFull`,
-`ErrThrottled`, `ErrUnavailable`, `ErrServer`, `ErrNoNodes`,
-`ErrClosed`, `ErrNoEnvelope`.
+## More
 
-`ErrNameTaken` (a topic name that differs from an existing one only in
-letter case) and `ErrTopicChanged` (the topic changed under the request)
-also match `ErrExists`.
+- **Batches.** `ProduceBatch` stores up to 100 messages in one request, all or
+  none; `WithBatch(n)` has each consumer worker fetch and ack `n` at a time.
+  Both need Narad 3.1.0.
+- **Envelopes and retries.** `WithEnvelope()` wraps a message with an id, a
+  timestamp, an attempt count and the last error. `client.Retry` republishes
+  with the count raised: point it at a delay child for backoff, or at a
+  parking topic as a dead letter.
+- **Topics and replay.** `EnsureTopic`, `SetSchema`, fan-out and delay
+  children, and `ReadAt`, `ReadFrom` and `Replay` to read from an offset.
+- **Logging and metrics.** `WithLogger(slog.Default())`, and Prometheus
+  metrics from the `prometheus` package:
 
-`*narad.Error` carries the status, the server's message and the node that
-answered. `*narad.ConnError` covers requests that never got a reply.
+  ```go
+  import naradprom "github.com/debanganthakuria/narad-go/prometheus"
 
-A read (`ReadAt`, `ReadFrom`, `Replay`, `Topic`, `Topics`, `Ping`)
-changes nothing, so it is never uncertain however it failed, and
-`WithCautiousRetries()` still retries it. `ErrUnavailable` is retryable
-whether a node sent it or the client raised it for a partition that
-cannot be read now.
+  metrics := naradprom.NewMetrics(prometheus.DefaultRegisterer)
+  client, err := narad.New(addr, narad.WithEvents(metrics.Observe))
+  ```
 
-## At-least-once, and what it asks of you
+  Only programs that import it compile the Prometheus client.
 
-**Handlers must be idempotent.** Narad delivers at least once and does
-not deduplicate. A broker restart can redeliver a message whose ack was
-still in the batch being persisted. This is not something to plan around
-later.
-
-The same property shapes producing. A produce whose reply was lost may
-still be committed, so retrying it can duplicate. The client retries by
-default, because a duplicate is recoverable and a lost message is not.
-When a duplicate is the worse outcome, `WithCautiousRetries()` hands the
-choice back and `Uncertain(err)` tells you when it matters.
-
-A node that refuses a produce outright (one being decommissioned, or
-whose schema validator is busy) answers 503 and stores nothing; the
-client moves to another node without waiting, with `WithCautiousRetries()`
-too. It tells those 503s apart by the broker's message. Any other produce
-503, such as a proxy's, may have stored the message, so it counts as
-uncertain and `WithCautiousRetries()` stops at it.
-
-## Logging
-
-Any logger with slog's method set works, which means `*slog.Logger` needs
-no adapter:
-
-```go
-narad.WithLogger(slog.Default())
-```
-
-The client logs sparingly: retries and node state changes at warn, and
-the failures a consumer cannot report any other way at error. For
-anything finer, use `WithEvents`.
-
-## Metrics
-
-Prometheus metrics live in the `prometheus` package of this module. The
-core `narad` package imports nothing beyond the standard library, so a
-program that never imports the metrics package never compiles the
-Prometheus client.
-
-The package is named `prometheus`, like client_golang's, so import it
-under an alias.
-Register the metrics and hand `Observe` to the client:
-
-```go
-import (
-    "github.com/debanganthakuria/narad-go"
-    naradprom "github.com/debanganthakuria/narad-go/prometheus"
-    "github.com/prometheus/client_golang/prometheus"
-)
-
-metrics := naradprom.NewMetrics(prometheus.DefaultRegisterer)
-client, err := narad.New(addr, narad.WithEvents(metrics.Observe))
-```
-
-`narad_requests_total`, `narad_request_duration_seconds`,
-`narad_retries_total` and `narad_node_up`.
-
-Give it a prefix to scope the metrics to your service, or to tell two
-clients in one process apart on a registry that refuses duplicate names:
-
-```go
-metrics := naradprom.NewMetrics(reg, naradprom.WithMetricsPrefix("payments"))
-// payments_narad_requests_total, and so on
-```
-
-`NewMetricsWithError` is the same thing without the panic, for when the
-prefix comes from configuration. Or skip it and write your own handler
-for `narad.Event`, which reports anywhere you like.
-
-## Also here
-
-Topics (`CreateTopic`, `EnsureTopic`, `Topic`, `Topics`, `DeleteTopic`,
-`SetSchema`), replay (`ReadAt`, `ReadFrom`, `Replay`), and health
-(`Ping`, `Health`).
-
-`WithRetention(d)` sets an age; leaving it out gives the operator's
-default, and `WithRetentionForever()` keeps records forever (a topic's
-`Retention` of zero reads the same way). While a partition's owner is
-down, `Topic` still answers, with `Partial` set and that partition's
-stats marked unavailable (`PartitionStats.Available`). `Replay` never
-skips a partition it cannot read: it waits for it (with jittered backoff,
-honouring Retry-After, for at most 30 seconds of continuous failure per
-partition and never past your ctx), then reports `ErrUnavailable` naming
-the partitions. The same wait covers a topic created a moment ago, whose
-partitions a node may not have seen assigned yet, and a read that fails
-in transit, which resumes where it failed. `ReadFrom` does not wait.
-
-`Ping` takes the node to probe, because a probe sent through the client's
-own load balancing would answer for whichever node came next. It does not
-count against that node's breaker either, so polling readiness during a
-rolling restart cannot take the cluster out of rotation.
-
-## One sharp edge
-
-**Payload round-trips are not always exact.** The broker keeps valid JSON
-verbatim, wraps other UTF-8 text in a JSON string, and base64-encodes
-binary with a flag. Only the third is marked on the wire, so a payload
-arriving as a JSON string is either text the broker quoted or a JSON
-string you really sent. `msg.Bytes()` unquotes it, which is right for the
-first and loses the quotes on the second. Send a struct and read it with
-`msg.Into` and the question never comes up.
-
-Keys do not have this problem. A key can be any bytes, and `msg.Key`
-holds exactly the bytes it was produced with: the broker sends a key that
-is not valid UTF-8 as base64 with a flag, and the client decodes it.
-`Key` is a string because `WithKey` takes one, so use `[]byte(msg.Key)`
-when the bytes matter. A message produced without a key has an empty
-`Key`; from Narad 3.1.0 on the broker no longer invents one for it.
+The [Go client guide](https://debanganthakuria.github.io/narad/build/go-sdk/)
+in the Narad docs walks through all of it, and
+[pkg.go.dev](https://pkg.go.dev/github.com/debanganthakuria/narad-go) has the
+full API.
 
 ## Compatibility
 
-Go 1.26 or later. Narad's `/v1` HTTP surface is stable, so a client built
-against it keeps working across broker upgrades. Batches, keep-forever
-retention and partial topic answers need Narad 3.1.0; everything else
-works against earlier releases too.
+Narad's `/v1` HTTP API is stable, so the client keeps working across broker
+upgrades. Batches, keep-forever retention and partial topic answers need
+Narad 3.1.0; everything else works with earlier brokers. The module is below
+v1.0.0, so a minor release may change the API; the
+[changelog](./CHANGELOG.md) says when.
+
+## Contributing and support
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md), [SUPPORT.md](./SUPPORT.md) and, for
+vulnerabilities, [SECURITY.md](./SECURITY.md).
 
 ## License
 
-Apache 2.0.
+[Apache 2.0](./LICENSE).

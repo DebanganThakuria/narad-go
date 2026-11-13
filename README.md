@@ -1,9 +1,16 @@
 # narad-go
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/debanganthakuria/narad-go.svg)](https://pkg.go.dev/github.com/debanganthakuria/narad-go)
+[![CI](https://github.com/DebanganThakuria/narad-go/actions/workflows/ci.yaml/badge.svg)](https://github.com/DebanganThakuria/narad-go/actions/workflows/ci.yaml)
+[![Release](https://img.shields.io/github/v/release/DebanganThakuria/narad-go?sort=semver)](https://github.com/DebanganThakuria/narad-go/releases/latest)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](./LICENSE)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/DebanganThakuria/narad-go)](./go.mod)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/DebanganThakuria/narad-go/badge)](https://scorecard.dev/viewer/?uri=github.com/DebanganThakuria/narad-go)
+
 The Go client for [Narad](https://github.com/DebanganThakuria/narad).
 
 ```sh
-go get github.com/debanganthakuria/narad-go
+go get github.com/debanganthakuria/narad-go@latest
 ```
 
 **The front door is SQS; the inside is Kafka.** You write against a work

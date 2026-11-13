@@ -7,7 +7,7 @@ body:
     id: version
     attributes:
       label: narad-go version or commit SHA
-      placeholder: e.g. v0.1.0 or 3f90f76
+      placeholder: e.g. v0.2.0 or 3f90f76
     validations:
       required: true
   - type: input

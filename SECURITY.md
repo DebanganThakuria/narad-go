@@ -27,7 +27,8 @@ support branches: upgrading to the latest release is the supported path.
 
 | Version | Supported |
 |---|---|
-| 0.1.x | Yes |
+| 0.2.x | Yes |
+| 0.1.x | No, upgrade to 0.2.x |
 
 While the module is below v1.0.0, a minor release may change the API; the
 release notes say what changed.

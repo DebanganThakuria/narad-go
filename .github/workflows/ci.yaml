@@ -17,7 +17,7 @@ jobs:
       GOWORK: "off"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # The version the client declares, not the newest one, so that the
       # promise of supporting it stays true.

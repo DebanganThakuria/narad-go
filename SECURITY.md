@@ -56,10 +56,10 @@ one is warranted, and named in the `### Security` section of that release's
 
 ## Scope
 
-The core module depends on the Go standard library alone, so a standard
+The core `narad` package imports the Go standard library alone, so a standard
 library advisory is fixed by building with a patched Go toolchain, not by a
-narad-go release. Advisories in the `prometheus` module's dependencies are in
-scope.
+narad-go release. Advisories in the module's dependencies (today the
+Prometheus client, used by the `prometheus` package) are in scope.
 
 An address with no scheme means `http://`, and `WithAuth` credentials travel
 as HTTP Basic auth, so over plain HTTP they are readable on the network. That

@@ -1,9 +1,7 @@
 version: 2
 updates:
-  # The root module has no dependencies by design; only the metrics module
-  # and the workflows have anything to update.
   - package-ecosystem: gomod
-    directory: "/prometheus"
+    directory: "/"
     schedule:
       interval: weekly
     open-pull-requests-limit: 10

@@ -13,9 +13,9 @@ commit. Underneath, a topic is a partitioned append-only log with offsets
 and retention, which is what pays for replay, cheap fan-out, and messages
 that survive being consumed.
 
-It depends on nothing beyond the standard library. The Prometheus metrics
-live in a module of their own, so only programs that use them pull the
-Prometheus client in.
+The core `narad` package imports nothing beyond the standard library. The
+Prometheus metrics live in their own package, so only programs that import
+it compile the Prometheus client.
 
 ## The whole of it
 
@@ -227,18 +227,13 @@ anything finer, use `WithEvents`.
 
 ## Metrics
 
-Prometheus metrics come in a separate module, so the client itself stays
-free of dependencies:
+Prometheus metrics live in the `prometheus` package of this module. The
+core `narad` package imports nothing beyond the standard library, so a
+program that never imports the metrics package never compiles the
+Prometheus client.
 
-```sh
-go get github.com/debanganthakuria/narad-go/prometheus
-```
-
-It is tagged on its own, as `prometheus/vX.Y.Z`, and names the oldest
-client release it works with; `go get` raises your client to that
-release if yours is older.
-
-Its package is named `prometheus` too, so import it under an alias.
+The package is named `prometheus`, like client_golang's, so import it
+under an alias.
 Register the metrics and hand `Observe` to the client:
 
 ```go

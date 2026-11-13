@@ -2,9 +2,9 @@
 //
 // It adapts the [narad.Event] stream a client emits through
 // [narad.WithEvents] to metrics registered on a caller-supplied
-// Registerer. It is a module of its own so that the client itself
-// depends on nothing beyond the standard library, and only programs that
-// want these metrics pull the Prometheus client in.
+// Registerer. It is a package of its own so that the core narad package
+// imports nothing beyond the standard library, and only programs that
+// import this one compile the Prometheus client.
 //
 // The package name matches client_golang's, so import it under an alias:
 //

@@ -33,11 +33,13 @@ The first tagged release. Until now `go get` recorded a pseudo-version of
   `Health` reports what the client believes about each node.
 - Typed errors (`ErrExists`, `ErrUnavailable` and the rest) and an optional
   `slog` logger.
-- `github.com/debanganthakuria/narad-go/prometheus`, a separate module that
-  exports the client's metrics to Prometheus, tagged `prometheus/v0.1.0`.
+- `github.com/debanganthakuria/narad-go/prometheus`, a package that exports
+  the client's metrics to Prometheus. It is part of this module; until now it
+  was a module of its own.
 
-The core module depends on the Go standard library alone and supports Go 1.23
-or later. Batches, keep-forever retention and partial topic answers need
+The core `narad` package imports the Go standard library alone, so a program
+that never imports the `prometheus` package never compiles the Prometheus
+client. The module supports Go 1.23 or later. Batches, keep-forever retention and partial topic answers need
 Narad 3.1.0; everything else works against earlier brokers too.
 
 [Unreleased]: https://github.com/DebanganThakuria/narad-go/compare/v0.1.0...HEAD

@@ -2,10 +2,10 @@
 # an advisory affects a dependency along a call path the code reaches.
 #
 # It runs on the newest stable Go, not the 1.23 that go.mod declares.
-# The core module depends on the standard library alone, so on 1.23 the
-# scan would only report standard-library advisories, which belong to
-# whatever toolchain an importer builds with, not to this library. On
-# stable Go what it reports is the prometheus module's dependencies.
+# Standard-library advisories belong to whatever toolchain an importer
+# builds with, not to this library, and on 1.23 they would drown out
+# what this scan is for: the module's own dependencies, which today are
+# the Prometheus client behind the prometheus package.
 #
 # The weekly run matters as much as the pull-request run: advisories are
 # published against dependencies that have not changed.
@@ -44,9 +44,5 @@ jobs:
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
 
-      - name: Scan client
-        run: govulncheck ./...
-
-      - name: Scan prometheus module
-        working-directory: prometheus
+      - name: Scan
         run: govulncheck ./...

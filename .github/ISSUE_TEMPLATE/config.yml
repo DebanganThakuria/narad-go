@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and support
+    url: https://github.com/DebanganThakuria/narad/discussions
+    about: Use Narad's Discussions for usage questions and troubleshooting, client questions included.
+  - name: Security issue
+    url: https://github.com/DebanganThakuria/narad-go/security/advisories/new
+    about: Report vulnerabilities privately instead of opening a public issue.

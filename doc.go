@@ -90,9 +90,9 @@ uncertain, and [WithCautiousRetries] still retries one that failed.
 
 [WithEvents] reports every request, retry and circuit-breaker change as
 an [Event], for metrics and logging. Ready-made Prometheus metrics live
-in the separate github.com/debanganthakuria/narad-go/prometheus module,
-so this package depends on nothing beyond the standard library and only
-programs that want those metrics pull the Prometheus client in.
+in the github.com/debanganthakuria/narad-go/prometheus package. This
+package imports nothing beyond the standard library, so only programs
+that import that one compile the Prometheus client.
 
 # What this package will not do for you
 

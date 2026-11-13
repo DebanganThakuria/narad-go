@@ -151,7 +151,7 @@ func WithHTTPClient(hc *http.Client) Option {
 }
 
 // WithEvents installs a callback for metrics and logging. Metrics.Observe
-// in the github.com/debanganthakuria/narad-go/prometheus module is the
+// in the github.com/debanganthakuria/narad-go/prometheus package is the
 // ready-made one for Prometheus.
 //
 // It runs on the calling goroutine, so keep it cheap and do not call

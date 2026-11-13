@@ -1,9 +1,9 @@
 # Known-advisory scanning, separate from CodeQL: govulncheck asks whether
 # an advisory affects a dependency along a call path the code reaches.
 #
-# It runs on the newest stable Go, not the 1.23 that go.mod declares.
+# It runs on the newest stable Go, not the minimum that go.mod declares.
 # Standard-library advisories belong to whatever toolchain an importer
-# builds with, not to this library, and on 1.23 they would drown out
+# builds with, not to this library, and on an old Go they would drown out
 # what this scan is for: the module's own dependencies, which today are
 # the Prometheus client behind the prometheus package.
 #

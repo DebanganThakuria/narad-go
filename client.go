@@ -16,7 +16,7 @@ import (
 )
 
 // Version is this client's version, sent in the User-Agent.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // MaxMessageBytes is the largest message the broker accepts.
 const MaxMessageBytes = 1 << 20

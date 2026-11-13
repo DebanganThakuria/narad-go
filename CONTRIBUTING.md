@@ -25,7 +25,7 @@ The repository is a single Go module with two packages:
 A feature that needs a third-party package belongs in its own package next to
 `prometheus`, never in `narad`.
 
-The client supports the Go version in `go.mod` (currently 1.23). Do not use
+The client supports the Go version in `go.mod` (currently 1.26). Do not use
 language or standard library features newer than that.
 
 ## Development

@@ -304,7 +304,7 @@ when the bytes matter. A message produced without a key has an empty
 
 ## Compatibility
 
-Go 1.23 or later. Narad's `/v1` HTTP surface is stable, so a client built
+Go 1.26 or later. Narad's `/v1` HTTP surface is stable, so a client built
 against it keeps working across broker upgrades. Batches, keep-forever
 retention and partial topic answers need Narad 3.1.0; everything else
 works against earlier releases too.

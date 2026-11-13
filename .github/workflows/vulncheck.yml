@@ -1,0 +1,52 @@
+# Known-advisory scanning, separate from CodeQL: govulncheck asks whether
+# an advisory affects a dependency along a call path the code reaches.
+#
+# It runs on the newest stable Go, not the 1.23 that go.mod declares.
+# The core module depends on the standard library alone, so on 1.23 the
+# scan would only report standard-library advisories, which belong to
+# whatever toolchain an importer builds with, not to this library. On
+# stable Go what it reports is the prometheus module's dependencies.
+#
+# The weekly run matters as much as the pull-request run: advisories are
+# published against dependencies that have not changed.
+name: Vulnerability scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "43 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GOWORK: "off"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      # Pinned so a new govulncheck release cannot start failing every
+      # open pull request. The advisory data is fetched at scan time, so
+      # the pin costs nothing in freshness.
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+
+      - name: Scan client
+        run: govulncheck ./...
+
+      - name: Scan prometheus module
+        working-directory: prometheus
+        run: govulncheck ./...

@@ -8,6 +8,16 @@ While the version is below 1.0.0, a minor release may change the API.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-13
+
+### Changed
+- **Breaking:** the module needs Go 1.26 or later, up from 1.23. Go 1.23 to
+  1.25 no longer receive security fixes from the Go team, and the Prometheus
+  client this module uses needs 1.26 from its 1.25.0 release on.
+- `github.com/prometheus/client_golang` 1.25.0, up from 1.20.5, with its
+  dependencies (`prometheus/common` 0.72.0, `procfs` 0.22.0, `client_model`
+  0.6.3, `golang.org/x/sys` 0.48.0, `protobuf` 1.36.12).
+
 ## [0.1.0] - 2026-11-13
 
 The first tagged release. Until now `go get` recorded a pseudo-version of
@@ -42,5 +52,6 @@ that never imports the `prometheus` package never compiles the Prometheus
 client. The module supports Go 1.23 or later. Batches, keep-forever retention and partial topic answers need
 Narad 3.1.0; everything else works against earlier brokers too.
 
-[Unreleased]: https://github.com/DebanganThakuria/narad-go/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/DebanganThakuria/narad-go/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/DebanganThakuria/narad-go/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/DebanganThakuria/narad-go/releases/tag/v0.1.0
